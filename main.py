@@ -18,9 +18,10 @@ dp = Dispatcher()
 
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 MEMORY_FILE = "strategies_memory.txt"
+NEWS_FILE = "news_memory.txt"
 
 async def handle(request):
-    return web.Response(text="Trading Bot is active and running 24/7!")
+    return web.Response(text="Trading & News Assistant Bot is active 24/7!")
 
 app = web.Application()
 app.add_routes([web.get('/', handle)])
@@ -48,7 +49,26 @@ async def fetch_live_prices():
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🌟 أهلاً يا ديلان! البوت جاهز. أرسل /analyze للحصول على التقرير الفوري للكريبتو.", parse_mode="HTML")
+    welcome_text = (
+        "🌟 <b>مرحباً بك يا زعيم ديلان في مساعد التداول والأخبار الذكي!</b> 🌟\n\n"
+        "• أرسل روابط يوتيوب لاستخلاص استراتيجيات SMC.\n"
+        "• قم بتوجيه (Forward) الأخبار من القنوات الإخبارية إليّ هنا لأقوم بتحليلها فوراً.\n"
+        "• استخدم الأمر /analyze للحصول على الصفقات المدمجة بالأسعار الحية والأخبار.\n"
+        "• استخدم /news لعرض أرشيف الأخبار والتحليلات."
+    )
+    await message.answer(welcome_text, parse_mode="HTML")
+
+@dp.message(Command("news"))
+async def cmd_news(message: types.Message):
+    if os.path.exists(NEWS_FILE):
+        with open(NEWS_FILE, "r", encoding="utf-8") as f:
+            news_content = f.read()
+        if news_content.strip():
+            if len(news_content) > 3000:
+                news_content = news_content[-3000:]
+            await message.answer(f"📰 <b>أرشيف الأخبار والتحليلات المرصودة:</b>\n\n<pre>{news_content}</pre>", parse_mode="HTML")
+            return
+    await message.answer("📭 لا توجد أخبار مسجلة حالياً. قم بتوجيه رسائل الأخبار إليّ لتحليلها.", parse_mode="HTML")
 
 @dp.message(Command("analyze"))
 async def cmd_analyze(message: types.Message):
@@ -60,28 +80,37 @@ async def cmd_analyze(message: types.Message):
     if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             memory_content = f.read()
+
+    news_content = "لا توجد أخبار عاجلة مسجلة حالياً."
+    if os.path.exists(NEWS_FILE):
+        with open(NEWS_FILE, "r", encoding="utf-8") as f:
+            news_content = f.read()
             
     if not memory_content.strip():
-        await message.answer("⚠️ الذاكرة فارغة! أرسل رابط يوتيوب أولاً للتعلم.")
+        await message.answer("⚠️ الذاكرة فارغة! أرسل رابط استراتيجية يوتيوب أولاً للتعلم.")
         return
 
-    await message.answer("🔍 <i>جاري تحليل أسواق الكريبتو المتاحة بناءً على استراتيجيات SMC...</i>", parse_mode="HTML")
+    await message.answer("🔍 <i>جاري تحليل الأسواق ودمج استراتيجيات SMC مع أحدث الأخبار والأسعار الحية...</i>", parse_mode="HTML")
 
     prices = await fetch_live_prices()
     btc_price = prices.get("BTC")
     eth_price = prices.get("ETH")
 
+    now = datetime.utcnow()
+    is_weekend = now.weekday() >= 5  # السبت والأحد
+
+    market_condition_note = (
+        "اليوم عطلة نهاية الأسبوع (الذهب والفضة والفوركس مغلقة). قم بالتركيز حصرياً على تحليل العملات الرقمية (Bitcoin و Ethereum)."
+        if is_weekend else "جميع الأسواق المالية مفتوحة حالياً."
+    )
+
     prompt = (
-        f"بناءً على استراتيجيات التداول المخزنة هنا:\n{memory_content}\n\n"
-        f"بما أن اليوم عطلة نهاية الأسبوع والذهب والفوركس مغلقان، قم فقط بتحليل عملتي **Bitcoin (BTC)** و **Ethereum (ETH)** بناءً على الأسعار الحية الحالية:\n"
-        f"- Bitcoin (BTC) السعر الحالي: ${btc_price}\n"
-        f"- Ethereum (ETH) السعر الحالي: ${eth_price}\n\n"
-        f"اكتب تقريراً احترافياً ومباشراً باللغة العربية يتضمن:\n"
-        f"1. اسم الأصل والاتجاه (Buy/Sell).\n"
-        f"2. نقطة الدخول بناءً على السعر الحالي.\n"
-        f"3. وقف الخسارة.\n"
-        f"4. أهداف جني الأرباح (TP1 حتى TP5 على الأقل).\n"
-        f"اجعل التنسيق واضحاً ومباشراً بدون مقدمات طويلة."
+        f"أنت متداول محترف ومدير مخاطر خبير. المعطيات:\n\n"
+        f"1. استراتيجيات التداول المخزنة:\n{memory_content}\n\n"
+        f"2. أحدث الأخبار والتحليلات المستقطبة:\n{news_content}\n\n"
+        f"3. حالة السوق: {market_condition_note}\n"
+        f"4. الأسعار الحية للكريبتو: BTC = ${btc_price}, ETH = ${eth_price}\n\n"
+        f"المطلوب تقرير صفقات تنفيذي دقيق يدمج تأثير الأخبار مع الاستراتيجية الفنية بوضوح تام."
     )
 
     try:
@@ -90,9 +119,12 @@ async def cmd_analyze(message: types.Message):
             contents=prompt,
         )
         analysis_result = response.text
-        response_text = f"🤖 <b>التقرير التنفيذي للكريبتو (عطلة نهاية الأسبوع):</b>\n\n{analysis_result}"
+        response_text = f"🤖 <b>التقرير التنفيذي الشامل (استراتيجيات + أخبار + أسعار حية):</b>\n\n{analysis_result}"
     except Exception as e:
         response_text = f"❌ حدث خطأ أثناء التوليد: {str(e)}"
+
+    if len(response_text) > 4000:
+        response_text = response_text[:4000] + "\n\n[... تم الاقتصاص لطول النص ...]"
 
     await message.answer(response_text, parse_mode="HTML")
 
@@ -103,15 +135,20 @@ def extract_youtube_id(url):
         return url.split("watch?v=")[1].split("&")[0]
     return None
 
-def save_to_memory(link, summary_text):
+def save_to_memory(file_path, text_content):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{now}] الرابط: {link}\nالملخص: {summary_text}\n" + "-" * 40 + "\n")
+    with open(file_path, "a", encoding="utf-8") as f:
+        f.write(f"[{now}] {text_content}\n" + "-" * 40 + "\n")
 
 @dp.message()
 async def handle_any_message(message: types.Message):
-    if message.text and ("http://" in message.text or "https://" in message.text):
-        video_link = message.text.strip()
+    text = message.text or message.caption
+    if not text:
+        return
+
+    # معالجة روابط يوتيوب
+    if "http://" in text or "https://" in text:
+        video_link = text.strip()
         video_id = extract_youtube_id(video_link)
         extracted_summary = "استراتيجية تداول SMC مسجلة."
         if video_id:
@@ -120,10 +157,32 @@ async def handle_any_message(message: types.Message):
                 extracted_summary = " ".join([item['text'] for item in transcript_list])[:300]
             except Exception:
                 pass
-        save_to_memory(video_link, extracted_summary)
-        await message.answer(f"✅ <b>تم حفظ الاستراتيجية بنجاح!</b>\n🔗 <code>{video_link}</code>", parse_mode="HTML")
+        save_to_memory(MEMORY_FILE, f"رابط يوتيوب: {video_link}\nالملخص: {extracted_summary}")
+        await message.answer(f"✅ <b>تم استيعاب وحفظ الاستراتيجية بنجاح!</b>\n🔗 <code>{video_link}</code>", parse_mode="HTML")
     else:
-        await message.answer("أهلاً يا ديلان! استخدم الأمر /analyze للحصول على الصفقات مباشرة.")
+        # معالجة الأخبار المحولة (Forwarded) أو المرسلة من المستخدم
+        if ai_client:
+            try:
+                news_prompt = (
+                    f"هذا خبر إخباري تم توجيهه من قنوات تداول:\n\"{text}\"\n\n"
+                    f"قم بتحليله باختصار واذكر: 1) ملخص الخبر. 2) تأثيره على الأسواق (إيجابي صعودي / سلبي هبوطي / محايد)."
+                )
+                res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=news_prompt)
+                news_analysis = res.text
+                
+                save_to_memory(NEWS_FILE, f"الخبر الأصلي: {text}\nالتحليل الآلي: {news_analysis}")
+                
+                response_alert = (
+                    f"⚡ <b>تم استقبال وتحليل الخبر بنجاح!</b>\n\n"
+                    f"📌 <b>التحليل والتأثير:</b>\n{news_analysis}\n\n"
+                    f"<i>✅ تم تخزينه في الذاكرة وسيعتمد في أمر /analyze القادم.</i>"
+                )
+                await message.answer(response_alert, parse_mode="HTML")
+                return
+            except Exception:
+                pass
+        
+        await message.answer("أهلاً يا زعيم! قم بتوجيه الأخبار إليّ لتحليلها، أو استخدم /analyze للحصول على الصفقات المحدثة.", parse_mode="HTML")
 
 async def main():
     await start_web_server()
