@@ -33,22 +33,22 @@ async def start_web_server():
     await site.start()
 
 async def fetch_live_prices():
-    prices = {}
     try:
         async with ClientSession() as session:
             async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd") as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    prices["BTC"] = data.get("bitcoin", {}).get("usd", "غير متوفر")
-                    prices["ETH"] = data.get("ethereum", {}).get("usd", "غير متوفر")
+                    return {
+                        "BTC": data.get("bitcoin", {}).get("usd", 79800),
+                        "ETH": data.get("ethereum", {}).get("usd", 2470)
+                    }
     except Exception:
-        prices["BTC"] = "79800"
-        prices["ETH"] = "2470"
-    return prices
+        pass
+    return {"BTC": 79800, "ETH": 2470}
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("🌟 أهلاً بك يا ديلان! البوت جاهز. أرسل /analyze للحصول على الصفقات فوراً.", parse_mode="HTML")
+    await message.answer("🌟 أهلاً يا ديلان! البوت جاهز. أرسل /analyze للحصول على التقرير الفوري للكريبتو.", parse_mode="HTML")
 
 @dp.message(Command("analyze"))
 async def cmd_analyze(message: types.Message):
@@ -65,24 +65,23 @@ async def cmd_analyze(message: types.Message):
         await message.answer("⚠️ الذاكرة فارغة! أرسل رابط يوتيوب أولاً للتعلم.")
         return
 
-    await message.message_id if hasattr(message, 'message_id') else None
-    waiting_msg = await message.answer("🔍 <i>جاري تحليل الأسواق المتاحة وتوليد الصفقات...</i>", parse_mode="HTML")
+    await message.answer("🔍 <i>جاري تحليل أسواق الكريبتو المتاحة بناءً على استراتيجيات SMC...</i>", parse_mode="HTML")
 
-    now = datetime.utcnow()
-    is_weekend = now.weekday() >= 5 # السبت والأحد
     prices = await fetch_live_prices()
+    btc_price = prices.get("BTC")
+    eth_price = prices.get("ETH")
 
     prompt = (
-        f"أنت متداول محترف. بناءً على استراتيجيات التداول المخزنة في الذاكرة:\n"
-        f"{memory_content}\n\n"
-        f"حالة السوق الحالية:\n"
-        f"- هل نحن في عطلة نهاية الأسبوع؟ {'نعم، الفوركس والمعادن مغلقة تماماً، قم بتحليل العملات الرقمية فقط (Bitcoin و Ethereum)' : 'لا، جميع الأسواق مفتوحة'}.\n"
-        f"- أسعار الكريبتو الحية حالياً: BTC = ${prices.get('BTC')}, ETH = ${prices.get('ETH')}.\n\n"
-        f"الشروط الصارمة:\n"
-        f"1. إذا كان السوق مغلقاً، لا تضع نهائياً صفقات للذهب أو الفضة أو الفوركس واكتفِ بالكريبتو.\n"
-        f"2. استخدم الأسعار الحقيقية المذكورة أعلاه كمرجع.\n"
-        f"3. لكل صفقة وفّر: 📌 اسم الأصل، 🧠 الاستراتيجية، 🟢 نقطة الدخول، 🛑 وقف الخسارة، 🎯 أهداف جني الأرباح (من 2 إلى 10 أهداف).\n"
-        f"اكتب التقرير باللغة العربية بأسلوب احترافي ومنسق."
+        f"بناءً على استراتيجيات التداول المخزنة هنا:\n{memory_content}\n\n"
+        f"بما أن اليوم عطلة نهاية الأسبوع والذهب والفوركس مغلقان، قم فقط بتحليل عملتي **Bitcoin (BTC)** و **Ethereum (ETH)** بناءً على الأسعار الحية الحالية:\n"
+        f"- Bitcoin (BTC) السعر الحالي: ${btc_price}\n"
+        f"- Ethereum (ETH) السعر الحالي: ${eth_price}\n\n"
+        f"اكتب تقريراً احترافياً ومباشراً باللغة العربية يتضمن:\n"
+        f"1. اسم الأصل والاتجاه (Buy/Sell).\n"
+        f"2. نقطة الدخول بناءً على السعر الحالي.\n"
+        f"3. وقف الخسارة.\n"
+        f"4. أهداف جني الأرباح (TP1 حتى TP5 على الأقل).\n"
+        f"اجعل التنسيق واضحاً ومباشراً بدون مقدمات طويلة."
     )
 
     try:
@@ -91,17 +90,9 @@ async def cmd_analyze(message: types.Message):
             contents=prompt,
         )
         analysis_result = response.text
-        response_text = f"🤖 <b>التقرير التنفيذي لصفقات الأسواق المتاحة:</b>\n\n{analysis_result}"
+        response_text = f"🤖 <b>التقرير التنفيذي للكريبتو (عطلة نهاية الأسبوع):</b>\n\n{analysis_result}"
     except Exception as e:
         response_text = f"❌ حدث خطأ أثناء التوليد: {str(e)}"
-
-    if len(response_text) > 4000:
-        response_text = response_text[:4000] + "\n\n[... تم الاقتصاص لطول النص ...]"
-
-    try:
-        await bot.delete_message(chat_id=message.chat.id, message_id=waiting_msg.message_id)
-    except Exception:
-        pass
 
     await message.answer(response_text, parse_mode="HTML")
 
@@ -122,11 +113,11 @@ async def handle_any_message(message: types.Message):
     if message.text and ("http://" in message.text or "https://" in message.text):
         video_link = message.text.strip()
         video_id = extract_youtube_id(video_link)
-        extracted_summary = "استراتيجية تداول مسجلة."
+        extracted_summary = "استراتيجية تداول SMC مسجلة."
         if video_id:
             try:
                 transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ar', 'en', 'fr'])
-                extracted_summary = " ".join([item['text'] for item in transcript_list])[:400]
+                extracted_summary = " ".join([item['text'] for item in transcript_list])[:300]
             except Exception:
                 pass
         save_to_memory(video_link, extracted_summary)
