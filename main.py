@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from aiohttp import web
+from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -17,7 +17,6 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
-
 MEMORY_FILE = "strategies_memory.txt"
 
 async def handle(request):
@@ -33,43 +32,51 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+# دالة لجلب الأسعار الحية للأسواق المتاحة
+async def fetch_live_prices():
+    prices = {}
+    try:
+        async with ClientSession() as session:
+            # جلب أسعار العملات الرقمية الحية (تعمل 24/7)
+            async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    prices["BTC"] = data.get("bitcoin", {}).get("usd", "غير متوفر")
+                    prices["ETH"] = data.get("ethereum", {}).get("usd", "غير متوفر")
+    except Exception:
+        prices["BTC"] = "يعذر الجلب"
+        prices["ETH"] = "يعذر الجلب"
+    return prices
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     welcome_text = (
-        "🌟 <b>مرحباً بك يا ديلان في بوت الصفقات الذكي المستقل!</b> 🌟\n\n"
-        "أنا جاهز لتحويل استراتيجيات اليوتيوب إلى صفقات دقيقة:\n"
-        "• أرسل روابط استراتيجيات اليوتيوب لحفظها.\n"
-        "• استخدم /analyze للحصول على صفقات مفصلة لكل سوق (ذهب، فضة، فوركس، كريبتو) مع نقاط الدخول، وقف الخسارة، وأهداف جني الأرباح (من 2 إلى 10 أهداف)."
+        "🌟 <b>مرحباً بك يا ديلان في بوت الصفقات الذكي والمحترف!</b> 🌟\n\n"
+        "• البوت يتحقق أوتوماتيكياً من أوقات فتح وإغلاق الأسواق.\n"
+        "• يمنع إرسال صفقات الفوركس والمعادن في عطلة نهاية الأسبوع.\n"
+        "• أرسل /analyze للتحقق من الأسواق وتوليد الصفقات بدقة."
     )
     await message.answer(welcome_text, parse_mode="HTML")
 
 @dp.message(Command("price"))
 async def cmd_price(message: types.Message):
+    prices = await fetch_live_prices()
+    now = datetime.utcnow()
+    weekday = now.weekday() # 5 = Saturday, 6 = Sunday
+    is_weekend = weekday >= 5
+
+    market_status = "🔴 مغلق (عطلة نهاية الأسبوع)" if is_weekend else "🟢 مفتوح ويتم التداول عليه"
+
     response_text = (
-        f"📊 <b>حالة الأسواق الحالية:</b>\n\n"
-        f"🟡 الذهب / الفضة (Forex/Metals): عطلة نهاية الأسبوع (جاهز للتحليل المسبق)\n"
-        f"₿ العملات الرقمية (Crypto): نشطة ومفتوحة 24/7\n\n"
-        f"<i>النظام يعمل بكفاءة 🟢</i>"
+        f"📊 <b>حالة الأسواق الفورية الحالية:</b>\n\n"
+        f"🟡 <b>الذهب والفضة والفوركس:</b> {market_status}\n"
+        f"₿ <b>العملات الرقمية (Crypto):</b> 🟢 مفتوحة 24/7\n"
+        f"  • Bitcoin (BTC): <code>${prices.get('BTC', 'جاري التحديث')}</code>\n"
+        f"  • Ethereum (ETH): <code>${prices.get('ETH', 'جاري التحديث')}</code>"
     )
     await message.answer(response_text, parse_mode="HTML")
 
-@dp.message(Command("memory"))
-async def cmd_memory(message: types.Message):
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            content = f.read()
-        if content.strip():
-            if len(content) > 3500:
-                content = content[-3500:] + "\n\n[... أحدث الذاكرة ...]"
-            response_text = f"🧠 <b>الاستراتيجيات المخزنة:</b>\n\n<pre>{content}</pre>"
-        else:
-            response_text = "📭 الذاكرة فارغة. أرسل روابط يوتيوب للتعلم!"
-    else:
-        response_text = "📭 لا توجد استراتيجيات مسجلة بعد."
-    
-    await message.answer(response_text, parse_mode="HTML")
-
-@dp.message(lambda message: message.text and message.text.startswith("/analyze"))
+@dp.message(Command("analyze"))
 async def cmd_analyze(message: types.Message):
     if not ai_client:
         await message.answer("⚠️ مفتاح `GEMINI_API_KEY` غير مضبوط في رندر.")
@@ -81,32 +88,44 @@ async def cmd_analyze(message: types.Message):
             memory_content = f.read()
             
     if not memory_content.strip():
-        await message.answer("⚠️ الذاكرة فارغة! أرسل استراتيجيات أولاً.")
+        await message.answer("⚠️ الذاكرة فارغة! أرسل رابط استراتيجية يوتيوب أولاً للتعلم.")
         return
 
-    await message.answer("🔍 <i>جاري تحليل أسواق الذهب، الفضة، الفوركس، والكريبتو وتوليد الصفقات بالتفصيل...</i>", parse_mode="HTML")
+    # التحقق من عطلة نهاية الأسبوع
+    now = datetime.utcnow()
+    is_weekend = now.weekday() >= 5 # السبت والأحد
 
-    market_data = (
-        "1. الذهب (XAU/USD)\n"
-        "2. الفضة (XAG/USD)\n"
-        "3. الفوركس (EUR/USD, GBP/USD)\n"
-        "4. العملات الرقمية (BTC/USD, ETH/USD - مفتوح 24/7)"
-    )
+    prices = await fetch_live_prices()
+
+    if is_weekend:
+        market_note = (
+            "⚠️ **تنبيه هام:** اليوم عطلة نهاية الأسبوع (السوق مغلق للذهب، الفضة، والفوركس).\n"
+            "لذلك **لن يتم إعطاء صفقات فعلية** لأزواج الفوركس والمعادن لعدم دقة الأسعار، "
+            "وسنقتصر التحليل على **العملات الرقمية (Crypto)** المفتوحة حالياً بأسعار حية:\n"
+            f"- Bitcoin (BTC) السعر الحالي: ${prices.get('BTC')}\n"
+            f"- Ethereum (ETH) السعر الحالي: ${prices.get('ETH')}"
+        )
+    else:
+        market_note = "🟢 الأسواق المالية مفتوحة حالياً، وجاري تحليل جميع الأصول بأسعارها الحية الحالية."
+
+    await message.answer(f"🔍 <i>جاري فحص حالة الأسواق وتطبيق استراتيجيات SMC بدقة...</i>\n\n{market_note}", parse_mode="HTML")
 
     prompt = (
-        f"أنت متداول محترف وخبير في الأسواق المالية. بناءً على استراتيجيات التداول المخزنة في الذاكرة:\n"
+        f"أنت متداول محترف. بناءً على استراتيجيات التداول المخزنة في الذاكرة:\n"
         f"{memory_content}\n\n"
-        f"وقم بتطبيقها على الأسواق التالية:\n"
-        f"{market_data}\n\n"
-        f"الشروط المطلوبة للتقرير:\n"
-        f"- لكل سوق/أصل مالي، قم بفصله في قسم مستقل بذاته.\n"
-        f"- اكتب لكل صفقة العناصر التالية بدقة شديدة وبدون إخلال:\n"
-        f"  * 📌 **اسم السوق / الزوج**\n"
-        f"  * 🧠 **الاستراتيجية المطبقة** (من الذاكرة)\n"
-        f"  * 🟢 **نقطة الدخول (Entry Point)**\n"
-        f"  * 🛑 **نقطة وقف الخسارة (Stop Loss)**\n"
-        f"  * 🎯 **أهداف جني الأرباح (Take Profit)**: قم بتوفير من 2 إلى 10 أهداف تداول تصاعدية (TP1, TP2, TP3 ... وصولاً حتى TP10 إن أمكن).\n"
-        f"اكتب التقرير باللغة العربية بأسلوب احترافي جداً ومنسق للمتداولين."
+        f"حالة السوق الحالية:\n"
+        f"- هل نحن في عطلة نهاية الأسبوع؟ {'نعم، الفوركس والمعادن مغلقة تماماً، قم بتحليل الكريبتو فقط' : 'لا، جميع الأسواق مفتوحة'}.\n"
+        f"- أسعار الكريبتو الحية حالياً: BTC = ${prices.get('BTC')}, ETH = ${prices.get('ETH')}.\n\n"
+        f"الشروط الصارمة للتقرير:\n"
+        f"1. إذا كان السوق مغلقاً، لا تقم نهائياً بوضع صفقات للذهب أو الفضة أو الفوركس واكتفِ بتحليل العملات الرقمية المتاحة الآن.\n"
+        f"2. استخدم الأسعار الحقيقية المذكورة أعلاه للكريبتو كمرجع لنقاط الدخول.\n"
+        f"3. لكل صفقة، وفّر:\n"
+        f"   * 📌 اسم الأصل\n"
+        f"   * 🧠 الاستراتيجية المطبقة\n"
+        f"   * 🟢 نقطة الدخول بناءً على السعر الحالي الفعلي\n"
+        f"   * 🛑 وقف الخسارة\n"
+        f"   * 🎯 أهداف جني الأرباح (من 2 إلى 10 أهداف تصاعدية).\n"
+        f"اكتب التقرير باللغة العربية بأسلوب احترافي للمتداولين."
     )
 
     try:
@@ -115,7 +134,7 @@ async def cmd_analyze(message: types.Message):
             contents=prompt,
         )
         analysis_result = response.text
-        response_text = f"🤖 <b>توصيات الصفقات الذكية لكل الأسواق:</b>\n\n{analysis_result}"
+        response_text = f"🤖 <b>تقرير الصفقات الذكية والمدقق حسب أوقات السوق:</b>\n\n{analysis_result}"
     except Exception as e:
         response_text = f"❌ خطأ في الاتصال بالذكاء الاصطناعي: {str(e)}"
 
@@ -159,7 +178,7 @@ async def handle_any_message(message: types.Message):
         
         if not success_mode and ai_client:
             try:
-                ai_prompt = f"المستخدم أرسل رابط يوتيوب: {video_link}. استخلص منه استراتيجية تداول احترافية (مثل SMC أو Price Action) يمكن حفظها في الذاكرة."
+                ai_prompt = f"المستخدم أرسل رابط يوتيوب: {video_link}. استخلص منه استراتيجية تداول احترافية (مثل SMC أو Price Action) لحفظها في الذاكرة."
                 ai_res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=ai_prompt)
                 extracted_summary = ai_res.text[:500]
                 success_mode = True
@@ -175,7 +194,7 @@ async def handle_any_message(message: types.Message):
         )
         await message.answer(response_text, parse_mode="HTML")
     else:
-        await message.answer("أهلاً يا ديلان! أرسل رابط يوتيوب جديد، أو استخدم /analyze للحصول على الصفقات التفصيلية.")
+        await message.answer("أهلاً يا ديلان! أرسل رابط يوتيوب جديد، أو استخدم /analyze لتحليل الأسواق المتاحة حالياً، أو /price لمعرفة الأسعار الفورية.")
 
 async def main():
     await start_web_server()
