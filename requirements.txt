@@ -3,3 +3,4 @@ aiogram==3.13.1
 pydantic
 requests
 pandas
+aiohttp==3.9.5
