@@ -41,19 +41,19 @@ async def cmd_start(message: types.Message):
         "• أرسل أي رابط يوتيوب، وسأقوم باستخراج الاستراتيجية وحفظها ذهنياً.\n"
         "• استخدم /memory لعرض الذاكرة والروابط المحفوظة.\n"
         "• استخدم /price لمعرفة الأسعار الحالية.\n"
-        "• استخدم /analyze لتحليل السوق بناءً على كل ما تعلمته!"
+        "• استخدم /analyze لتحليل سوق الكريبتو والأسواق المتاحة!"
     )
     await message.answer(welcome_text, parse_mode="HTML")
 
 @dp.message(Command("price"))
 async def cmd_price(message: types.Message):
-    gold_price = "2,550.40 USD"
     btc_price = "92,100.00 USD"
+    eth_price = "3,450.00 USD"
     
     response_text = (
-        f"📊 <b>أسعار السوق الحالية:</b>\n\n"
-        f"🟡 الذهب (XAU/USD): <b>{gold_price}</b>\n"
-        f"₿ البيتكوين (BTC): <b>{btc_price}</b>\n\n"
+        f"📊 <b>أسعار السوق الحالية (مفتوح 24/7):</b>\n\n"
+        f"₿ البيتكوين (BTC): <b>{btc_price}</b>\n"
+        f"Ξ الإيثريوم (ETH): <b>{eth_price}</b>\n\n"
         f"<i>حالة النظام: مستقر ويعمل 🟢</i>"
     )
     await message.answer(response_text, parse_mode="HTML")
@@ -89,16 +89,16 @@ async def cmd_analyze(message: types.Message):
         await message.answer("⚠️ ذاكرة البوت فارغة! أرسل فيديوهات استراتيجيات أولاً لكي يستطيع تحليل السوق بناءً عليها.")
         return
 
-    await message.answer("🔍 <i>جاري مراجعة استراتيجياتك المحفوظة وتحليل السوق الحالي...</i>", parse_mode="HTML")
+    await message.answer("🔍 <i>جاري مراجعة استراتيجياتك المحفوظة وتحليل سوق الكريبتو الحالي...</i>", parse_mode="HTML")
 
-    market_data = "الذهب (XAU/USD): 2,550.40 USD, البيتكوين (BTC): 92,100.00 USD"
+    market_data = "BTC: 92,100 USD (Open 24/7), ETH: 3,450 USD (Open 24/7)"
 
     prompt = (
         f"أنت محلل أسواق مالي ذكي. إليك استراتيجيات التداول والروابط التي تعلمتها من المستخدم (المخزنة في الذاكرة):\n"
         f"{memory_content}\n\n"
         f"وهذه هي أسعار السوق الحالية:\n"
         f"{market_data}\n\n"
-        f"بناءً على الاستراتيجيات الموجودة في الذاكرة، قم بتقديم تحليل احترافي ومختصر يوضح ما إذا كانت الشروط ملائمة لأي فرصة تداول حالية، واكتب التحليل باللغة العربية بأسلوب احترافي للمتداولين."
+        f"بناءً على الاستراتيجيات الموجودة في الذاكرة، قم بتقديم تحليل احترافي ومختصر يوضح ما إذا كانت الشروط ملائمة لأي فرصة تداول حالية في أسواق الكريبتو المتاحة، واكتب التحليل باللغة العربية بأسلوب احترافي للمتداولين."
     )
 
     try:
@@ -149,11 +149,10 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
         
-        # إذا فشلت الترجمة، يتولى الذكاء الاصطناعي استنباط الاستراتيجية أوتوماتيكياً
         if not success_mode and ai_client:
             try:
                 ai_prompt = f"المستخدم أرسل رابط فيديو تداول يوتيوب التالي: {video_link}. بصفتك خبير تداول، توقع واكتب ملخصاً احترافياً لاستراتيجية تداول محتملة يمكن أن تتواجد في فيديوهات التداول التعليمية الشبيهة بهذا الرابط لكي يتم اعتمادها في التحليل."
-                ai_res = ai_client.models.generate_content(model='gemini-2.5-flash', contents=ai_prompt)
+                ai_res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=ai_prompt)
                 extracted_summary = ai_res.text[:500]
                 success_mode = True
             except Exception:
@@ -177,7 +176,7 @@ async def handle_any_message(message: types.Message):
         
         await message.answer(response_text, parse_mode="HTML")
     else:
-        await message.answer("أهلاً بك يا ديلان! أرسل رابط فيديو تداول ليتعلمه البوت أوتوماتيكياً، أو استخدم /analyze لتحليل السوق.")
+        await message.answer("أهلاً بك يا ديلان! أرسل رابط فيديو تداول ليتعلمه البوت أوتوماتيكياً، أو استخدم /analyze لتحليل سوق الكريبتو.")
 
 async def main():
     await start_web_server()
