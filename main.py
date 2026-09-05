@@ -65,30 +65,32 @@ async def handle_any_message(message: types.Message):
         
         if video_id:
             try:
-                # محاولة سحب تفريغ النص من يوتيوب
-                transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ar', 'en'])
+                # قائمة أشهر اللغات العالمية لتغطية معظم الفيديوهات التعليمية والتداول
+                popular_languages = ['ar', 'en', 'fr', 'es', 'de', 'it', 'ru', 'pt', 'tr']
+                
+                # محاولة سحب التفريغ باختيار إحدى اللغات المشهورة المتاحة
+                transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=popular_languages)
                 transcript_text = " ".join([item['text'] for item in transcript_list])
                 
-                # اختصار النص لو كان طويلاً جداً للعرض
                 short_summary = transcript_text[:400] + "..." if len(transcript_text) > 400 else transcript_text
                 
                 response_text = (
                     f"🧠 <b>تم قراءة وتحليل الفيديو بنجاح!</b>\n\n"
-                    f"📌 <b>مقتطف من الشرح المتعلم:</b>\n"
+                    f"📌 <b>مقتطف من النص المستخرج:</b>\n"
                     f"<i>\"{short_summary}\"</i>\n\n"
-                    f"✅ تم استخراج الاستراتيجية وحفظها في ذاكرة البوت بنجاح!"
+                    f"✅ تم سحب الاستراتيجية وحفظها في ذاكرة البوت بنجاح!"
                 )
             except Exception as e:
                 response_text = (
-                    f"📥 <b>تم استلام الرابط بنجاح!</b>\n\n"
+                    f"📥 <b>تم استلام الرابط وحفظه بنجاح!</b>\n\n"
                     f"الرابط: <code>{video_link}</code>\n"
-                    f"⚠️ (عذراً، هذا الفيديو لا يحتوي على نصوص مترجمة أو تفريغ متاح، لكن تم حفظه في السجل للتحليل اليدوي)."
+                    f"<i>(ملاحظة: هذا الفيديو لا تتوفر له ترجمة تدعم اللغات المشهورة حالياً، لكن الرابط محفوظ في سجلك للرجوع إليه).</i>"
                 )
         else:
             response_text = (
                 f"📥 <b>تم استلام الرابط بنجاح!</b>\n\n"
                 f"الرابط: <code>{video_link}</code>\n"
-                f"<i>جاري حفظه ومعالجة محتواه لاستراتيجيات التداول الخاصة بك... 🧠</i>"
+                f"<i>جاري حفظه لاستراتيجيات التداول الخاصة بك... 🧠</i>"
             )
             
         await message.answer(response_text, parse_mode="HTML")
