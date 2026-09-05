@@ -1,5 +1,5 @@
 --only-binary=:all:
-python-telegram-bot
+aiogram==3.13.1
 pydantic
 requests
 pandas
