@@ -6,7 +6,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from youtube_transcript_api import YouTubeTranscriptApi
-from google import genai
+import google.genai as genai
 
 TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
