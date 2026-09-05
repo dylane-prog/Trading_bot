@@ -74,7 +74,7 @@ async def cmd_memory(message: types.Message):
     
     await message.answer(response_text, parse_mode="HTML")
 
-@dp.message(Command("analyze"))
+@dp.message(lambda message: message.text and message.text.startswith("/analyze"))
 async def cmd_analyze(message: types.Message):
     if not ai_client:
         await message.answer("⚠️ تنبيه: لم يتم ضبط مفتاح `GEMINI_API_KEY` في إعدادات المنصة (Render).")
