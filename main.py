@@ -36,25 +36,20 @@ async def start_web_server():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     welcome_text = (
-        "🌟 <b>مرحباً بك مجدداً يا ديلان في بوت التحليل الذكي المستقل!</b> 🌟\n\n"
-        "أنا جاهز لتحليل استراتيجياتك أوتوماتيكياً:\n"
-        "• أرسل أي رابط يوتيوب، وسأقوم باستخراج الاستراتيجية وحفظها ذهنياً.\n"
-        "• استخدم /memory لعرض الذاكرة والروابط المحفوظة.\n"
-        "• استخدم /price لمعرفة الأسعار الحالية.\n"
-        "• استخدم /analyze لتحليل سوق الكريبتو والأسواق المتاحة!"
+        "🌟 <b>مرحباً بك يا ديلان في بوت الصفقات الذكي المستقل!</b> 🌟\n\n"
+        "أنا جاهز لتحويل استراتيجيات اليوتيوب إلى صفقات دقيقة:\n"
+        "• أرسل روابط استراتيجيات اليوتيوب لحفظها.\n"
+        "• استخدم /analyze للحصول على صفقات مفصلة لكل سوق (ذهب، فضة، فوركس، كريبتو) مع نقاط الدخول، وقف الخسارة، وأهداف جني الأرباح (من 2 إلى 10 أهداف)."
     )
     await message.answer(welcome_text, parse_mode="HTML")
 
 @dp.message(Command("price"))
 async def cmd_price(message: types.Message):
-    btc_price = "92,100.00 USD"
-    eth_price = "3,450.00 USD"
-    
     response_text = (
-        f"📊 <b>أسعار السوق الحالية (مفتوح 24/7):</b>\n\n"
-        f"₿ البيتكوين (BTC): <b>{btc_price}</b>\n"
-        f"Ξ الإيثريوم (ETH): <b>{eth_price}</b>\n\n"
-        f"<i>حالة النظام: مستقر ويعمل 🟢</i>"
+        f"📊 <b>حالة الأسواق الحالية:</b>\n\n"
+        f"🟡 الذهب / الفضة (Forex/Metals): عطلة نهاية الأسبوع (جاهز للتحليل المسبق)\n"
+        f"₿ العملات الرقمية (Crypto): نشطة ومفتوحة 24/7\n\n"
+        f"<i>النظام يعمل بكفاءة 🟢</i>"
     )
     await message.answer(response_text, parse_mode="HTML")
 
@@ -65,19 +60,19 @@ async def cmd_memory(message: types.Message):
             content = f.read()
         if content.strip():
             if len(content) > 3500:
-                content = content[-3500:] + "\n\n[... تم إظهار أحدث محتوى الذاكرة ...]"
-            response_text = f"🧠 <b>ذاكرة الاستراتيجيات والروابط المحفوظة:</b>\n\n<pre>{content}</pre>"
+                content = content[-3500:] + "\n\n[... أحدث الذاكرة ...]"
+            response_text = f"🧠 <b>الاستراتيجيات المخزنة:</b>\n\n<pre>{content}</pre>"
         else:
-            response_text = "📭 ذاكرة البوت فارغة حالياً. أرسل بعض روابط الفيديوهات لتبدأ التعلم!"
+            response_text = "📭 الذاكرة فارغة. أرسل روابط يوتيوب للتعلم!"
     else:
-        response_text = "📭 لا توجد ذاكرة مسجلة حتى الآن. أرسل روابط الفيديوهات وسأقوم بتخزينها."
+        response_text = "📭 لا توجد استراتيجيات مسجلة بعد."
     
     await message.answer(response_text, parse_mode="HTML")
 
 @dp.message(lambda message: message.text and message.text.startswith("/analyze"))
 async def cmd_analyze(message: types.Message):
     if not ai_client:
-        await message.answer("⚠️ تنبيه: لم يتم ضبط مفتاح `GEMINI_API_KEY` في إعدادات المنصة (Render).")
+        await message.answer("⚠️ مفتاح `GEMINI_API_KEY` غير مضبوط في رندر.")
         return
         
     memory_content = ""
@@ -86,19 +81,32 @@ async def cmd_analyze(message: types.Message):
             memory_content = f.read()
             
     if not memory_content.strip():
-        await message.answer("⚠️ ذاكرة البوت فارغة! أرسل فيديوهات استراتيجيات أولاً لكي يستطيع تحليل السوق بناءً عليها.")
+        await message.answer("⚠️ الذاكرة فارغة! أرسل استراتيجيات أولاً.")
         return
 
-    await message.answer("🔍 <i>جاري مراجعة استراتيجياتك المحفوظة وتحليل سوق الكريبتو الحالي...</i>", parse_mode="HTML")
+    await message.answer("🔍 <i>جاري تحليل أسواق الذهب، الفضة، الفوركس، والكريبتو وتوليد الصفقات بالتفصيل...</i>", parse_mode="HTML")
 
-    market_data = "BTC: 92,100 USD (Open 24/7), ETH: 3,450 USD (Open 24/7)"
+    market_data = (
+        "1. الذهب (XAU/USD)\n"
+        "2. الفضة (XAG/USD)\n"
+        "3. الفوركس (EUR/USD, GBP/USD)\n"
+        "4. العملات الرقمية (BTC/USD, ETH/USD - مفتوح 24/7)"
+    )
 
     prompt = (
-        f"أنت محلل أسواق مالي ذكي. إليك استراتيجيات التداول والروابط التي تعلمتها من المستخدم (المخزنة في الذاكرة):\n"
+        f"أنت متداول محترف وخبير في الأسواق المالية. بناءً على استراتيجيات التداول المخزنة في الذاكرة:\n"
         f"{memory_content}\n\n"
-        f"وهذه هي أسعار السوق الحالية:\n"
+        f"وقم بتطبيقها على الأسواق التالية:\n"
         f"{market_data}\n\n"
-        f"بناءً على الاستراتيجيات الموجودة في الذاكرة، قم بتقديم تحليل احترافي ومختصر يوضح ما إذا كانت الشروط ملائمة لأي فرصة تداول حالية في أسواق الكريبتو المتاحة، واكتب التحليل باللغة العربية بأسلوب احترافي للمتداولين."
+        f"الشروط المطلوبة للتقرير:\n"
+        f"- لكل سوق/أصل مالي، قم بفصله في قسم مستقل بذاته.\n"
+        f"- اكتب لكل صفقة العناصر التالية بدقة شديدة وبدون إخلال:\n"
+        f"  * 📌 **اسم السوق / الزوج**\n"
+        f"  * 🧠 **الاستراتيجية المطبقة** (من الذاكرة)\n"
+        f"  * 🟢 **نقطة الدخول (Entry Point)**\n"
+        f"  * 🛑 **نقطة وقف الخسارة (Stop Loss)**\n"
+        f"  * 🎯 **أهداف جني الأرباح (Take Profit)**: قم بتوفير من 2 إلى 10 أهداف تداول تصاعدية (TP1, TP2, TP3 ... وصولاً حتى TP10 إن أمكن).\n"
+        f"اكتب التقرير باللغة العربية بأسلوب احترافي جداً ومنسق للمتداولين."
     )
 
     try:
@@ -107,9 +115,9 @@ async def cmd_analyze(message: types.Message):
             contents=prompt,
         )
         analysis_result = response.text
-        response_text = f"🤖 <b>تقرير التحليل الذكي للاستراتيجيات:</b>\n\n{analysis_result}"
+        response_text = f"🤖 <b>توصيات الصفقات الذكية لكل الأسواق:</b>\n\n{analysis_result}"
     except Exception as e:
-        response_text = f"❌ حدث خطأ أثناء الاتصال بنموذج الذكاء الاصطناعي: {str(e)}"
+        response_text = f"❌ خطأ في الاتصال بالذكاء الاصطناعي: {str(e)}"
 
     if len(response_text) > 4000:
         response_text = response_text[:4000] + "\n\n[... تم اقتصاص التقرير لطوله ...]"
@@ -127,7 +135,7 @@ def save_to_memory(link, summary_text):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     with open(MEMORY_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{now}] الرابط: {link}\n")
-        f.write(f"المحتوى/الملخص: {summary_text}\n")
+        f.write(f"الملخص: {summary_text}\n")
         f.write("-" * 40 + "\n")
 
 @dp.message()
@@ -151,32 +159,23 @@ async def handle_any_message(message: types.Message):
         
         if not success_mode and ai_client:
             try:
-                ai_prompt = f"المستخدم أرسل رابط فيديو تداول يوتيوب التالي: {video_link}. بصفتك خبير تداول، توقع واكتب ملخصاً احترافياً لاستراتيجية تداول محتملة يمكن أن تتواجد في فيديوهات التداول التعليمية الشبيهة بهذا الرابط لكي يتم اعتمادها في التحليل."
+                ai_prompt = f"المستخدم أرسل رابط يوتيوب: {video_link}. استخلص منه استراتيجية تداول احترافية (مثل SMC أو Price Action) يمكن حفظها في الذاكرة."
                 ai_res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=ai_prompt)
                 extracted_summary = ai_res.text[:500]
                 success_mode = True
             except Exception:
-                extracted_summary = "رابط استراتيجية تداول تم حفظه بنجاح للتحليل الأوتوماتيكي."
+                extracted_summary = "استراتيجية تداول مسجلة للتحليل الأوتوماتيكي."
 
         save_to_memory(video_link, extracted_summary)
         
-        if success_mode:
-            response_text = (
-                f"🤖🧠 <b>تم استيعاب الاستراتيجية أوتوماتيكياً بنجاح!</b>\n\n"
-                f"🔗 الرابط: <code>{video_link}</code>\n"
-                f"📌 <b>الملخص المستخلص بالذكاء الاصطناعي:</b>\n"
-                f"<i>\"{extracted_summary}\"</i>\n\n"
-                f"✅ أصبحت الاستراتيجية جزءاً من ذاكرة البوت."
-            )
-        else:
-            response_text = (
-                f"📥 <b>تم حفظ رابط الفيديو في الذاكرة بنجاح!</b>\n\n"
-                f"الرابط: <code>{video_link}</code>"
-            )
-        
+        response_text = (
+            f"🤖🧠 <b>تم استيعاب الاستراتيجية وحفظها بنجاح!</b>\n\n"
+            f"🔗 <code>{video_link}</code>\n"
+            f"📌 <b>الملخص:</b> <i>\"{extracted_summary}\"</i>"
+        )
         await message.answer(response_text, parse_mode="HTML")
     else:
-        await message.answer("أهلاً بك يا ديلان! أرسل رابط فيديو تداول ليتعلمه البوت أوتوماتيكياً، أو استخدم /analyze لتحليل سوق الكريبتو.")
+        await message.answer("أهلاً يا ديلان! أرسل رابط يوتيوب جديد، أو استخدم /analyze للحصول على الصفقات التفصيلية.")
 
 async def main():
     await start_web_server()
