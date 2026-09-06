@@ -19,7 +19,7 @@ dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 MEMORY_FILE = "strategies_memory.txt"
 NEWS_FILE = "news_memory.txt"
-TRADES_LOG_FILE = "trades_performance_log.txt" # سجل مراجعة وتقييم الصفقات
+TRADES_LOG_FILE = "trades_performance_log.txt"
 
 async def handle(request):
     return web.Response(text="Fully Autonomous Smart Trading & Self-Review Bot is active 24/7!")
@@ -48,7 +48,6 @@ async def fetch_live_prices():
         pass
     return {"BTC": 79800, "ETH": 2470}
 
-# دالة توليد التقرير الذكي مع تقييم الصفقات ومددها الزمنية
 async def generate_market_report():
     if not ai_client:
         return "⚠️ مفتاح الذكاء الاصطناعي غير مضبوط."
@@ -73,10 +72,10 @@ async def generate_market_report():
     eth_price = prices.get("ETH")
 
     now = datetime.utcnow()
-    is_weekend = now.weekday() >= 5  # السبت والأحد
+    is_weekend = now.weekday() >= 5
 
     market_condition_note = (
-        "اليوم عطلة نهاية الأسبوع (الأسواق التقليدية مغلقة). التركيز حصرياً على العملات الرقمية (Bitcoin و Ethereum)."
+        "اليوم عطلة نهاية الأسبوع. التركيز حصرياً على العملات الرقمية (Bitcoin و Ethereum)."
         if is_weekend else "جميع الأسواق المالية مفتوحة حالياً."
     )
 
@@ -87,10 +86,10 @@ async def generate_market_report():
         f"3. أحدث الأخبار المرصودة:\n{news_content}\n\n"
         f"4. حالة السوق الحالية: {market_condition_note}\n"
         f"5. الأسعار الحية للكريبتو: BTC = ${btc_price}, ETH = ${eth_price}\n\n"
-        f"المطلوب تقرير صفقات تنفيذي دقيق يلتزم بالشروط التالية:\n"
-        f"- تصنيف الاستراتيجيات المستخدمة حسب كفاءتها (مثلاً: عالية الدقة، متوسطة الكفاءة، قيد الاختبار).\n"
-        f"- عند إعطاء أي صفقة مقترحة، **يجب** تحديد **مدة تحقيق الصفقة بدقة** (بحيث تكون ضمن نطاق زمني منطقي يتراوح حصرياً بين الحد الأدنى دقيقة واحدة (1m) والحد الأقصى 72 ساعة (72h)).\n"
-        f"- تقديم الصفقات بجدول أو نقاط واضحة ومباشرة."
+        f"المطلوب تقرير صفقات تنفيذي دقيق:\n"
+        f"- تصنيف الاستراتيجيات المستخدمة حسب كفاءتها.\n"
+        f"- عند إعطاء أي صفقة مقترحة، يجب تحديد مدة تحقيق الصفقة بدقة ضمن نطاق حصري بين دقيقة واحدة (1m) و 72 ساعة (72h).\n"
+        f"- تجنب نهائياً استخدام أي رموز برمجية HTML معقدة لكي لا تحدث أخطاء في العرض."
     )
 
     try:
@@ -100,7 +99,6 @@ async def generate_market_report():
         )
         report_text = response.text
         
-        # حفظ نسخة من التقرير في سجل الصفقات لكي يقوم البوت بمراجعتها واستنتاج الأفضل منها لاحقاً
         with open(TRADES_LOG_FILE, "a", encoding="utf-8") as log_f:
             log_f.write(f"--- تقييم ومراجعة تلقائية [{now.strftime('%Y-%m-%d %H:%M')}] ---\n{report_text[:500]}...\n\n")
             
@@ -108,7 +106,6 @@ async def generate_market_report():
     except Exception as e:
         return f"❌ حدث خطأ أثناء التوليد: {str(e)}"
 
-# مهمة الخلفية التي تعمل أوتوماتيكياً كل ساعة
 async def hourly_background_reporter():
     await asyncio.sleep(15)
     while True:
@@ -118,10 +115,11 @@ async def hourly_background_reporter():
                     chat_id = f.read().strip()
                 if chat_id:
                     report = await generate_market_report()
-                    full_msg = f"⏰ <b>التقرير التلقائي الساعي (مع المراجعة الذاتية والتصنيف):</b>\n\n{report}"
+                    full_msg = f"التقرير التلقائي الساعي:\n\n{report}"
                     if len(full_msg) > 4000:
                         full_msg = full_msg[:4000]
-                    await bot.send_message(chat_id=int(chat_id), text=full_msg, parse_mode="HTML")
+                    # إرسال بدون parse_mode لتجنب أي أخطاء في الرموز
+                    await bot.send_message(chat_id=int(chat_id), text=full_msg)
         except Exception as e:
             logging.error(f"Error in background reporter: {e}")
         
@@ -133,13 +131,12 @@ async def cmd_start(message: types.Message):
         f.write(str(message.chat.id))
 
     welcome_text = (
-        "🌟 <b>مرحباً بك يا زعيم ديلان في نظام التداول الذاتي والمراجعة الذكية!</b> 🌟\n\n"
+        "مرحباً بك يا زعيم ديلان في نظام التداول الذاتي والمراجعة الذكية!\n\n"
         "• يراجع البوت الصفقات ويصنف الاستراتيجيات الأصح نسبياً أوتوماتيكياً.\n"
-        "• كل صفقة مقترحة تتضمن الآن <b>مدة التحقيق بدقة</b> (بين دقيقة واحدة و 72 ساعة كحد أقصى).\n"
-        "• إرسال التقارير التلقائية كل ساعة في الخلفية.\n"
-        "• أرسل روابط يوتيوب للتعلم أو جهّز الأخبار للتوجيه."
+        "• كل صفقة مقترحة تتضمن مدة التحقيق بدقة (بين دقيقة واحدة و 72 ساعة كحد أقصى).\n"
+        "• إرسال التقارير التلقائية كل ساعة في الخلفية دون أخطاء."
     )
-    await message.answer(welcome_text, parse_mode="HTML")
+    await message.answer(welcome_text)
 
 @dp.message(Command("strategies"))
 async def cmd_strategies(message: types.Message):
@@ -149,9 +146,9 @@ async def cmd_strategies(message: types.Message):
         if content.strip():
             if len(content) > 3000:
                 content = content[-3000:]
-            await message.answer(f"📚 <b>مكتبة الاستراتيجيات المصنفة:</b>\n\n<pre>{content}</pre>", parse_mode="HTML")
+            await message.answer(f"مكتبة الاستراتيجيات المصنفة:\n\n{content}")
             return
-    await message.answer("📭 لا توجد استراتيجيات مخزنة بعد.", parse_mode="HTML")
+    await message.answer("لا توجد استراتيجيات مخزنة بعد.")
 
 @dp.message(Command("news"))
 async def cmd_news(message: types.Message):
@@ -161,21 +158,21 @@ async def cmd_news(message: types.Message):
         if news_content.strip():
             if len(news_content) > 3000:
                 news_content = news_content[-3000:]
-            await message.answer(f"📰 <b>أرشيف الأخبار والتحليلات:</b>\n\n<pre>{news_content}</pre>", parse_mode="HTML")
+            await message.answer(f"أرشيف الأخبار والتحليلات:\n\n{news_content}")
             return
-    await message.answer("📭 لا توجد أخبار مسجلة حالياً.", parse_mode="HTML")
+    await message.answer("لا توجد أخبار مسجلة حالياً.")
 
 @dp.message(Command("analyze"))
 async def cmd_analyze(message: types.Message):
     with open("last_chat_id.txt", "w") as f:
         f.write(str(message.chat.id))
 
-    await message.answer("🔍 <i>جاري مراجعة الأداء، تصنيف الاستراتيجيات، وتوليد صفقات مدتها محسوبة بدقة...</i>", parse_mode="HTML")
+    await message.answer("جاري مراجعة الأداء، تصنيف الاستراتيجيات، وتوليد صفقات مدتها محسوبة بدقة...")
     report = await generate_market_report()
-    response_text = f"🤖 <b>التقرير التنفيذي المصنف والمراجع ذاتياً:</b>\n\n{report}"
+    response_text = f"التقرير التنفيذي المصنف والمراجع ذاتياً:\n\n{report}"
     if len(response_text) > 4000:
         response_text = response_text[:4000]
-    await message.answer(response_text, parse_mode="HTML")
+    await message.answer(response_text)
 
 def extract_youtube_id(url):
     if "youtu.be/" in url:
@@ -198,7 +195,6 @@ async def handle_any_message(message: types.Message):
     if not text:
         return
 
-    # معالجة روابط يوتيوب
     if "http://" in text or "https://" in text:
         video_link = text.strip()
         video_id = extract_youtube_id(video_link)
@@ -210,39 +206,38 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
 
-        await message.answer("🔄 <i>جاري تحليل الاستراتيجية، إخضاعها للباك تست، وتصنيفها في الذاكرة الذكية...</i>", parse_mode="HTML")
+        await message.answer("جاري تحليل الاستراتيجية، إخضاعها للباك تست، وتصنيفها في الذاكرة الذكية...")
 
         if ai_client:
             try:
                 eval_prompt = (
                     f"بناءً على نص الفيديو المستخرج التالي:\n\"{transcript_text}\"\n\n"
                     f"قم بالآتي:\n"
-                    f"1. اقترح اسماً للاستراتيجية وحدد تصنيفها الأولي (عالية الدقة / متوسطة / قيد المراجعة).\n"
+                    f"1. اقترح اسماً للاستراتيجية وحدد تصنيفها الأولي.\n"
                     f"2. قم بعمل محاكاة لجدول كفاءتها (Win Rate & Profit Factor).\n"
                     f"3. اكتب كود برمجي مجاني بـ (Pine Script v5) لتطبيقها على TradingView.\n"
-                    f"قدم الرد باللغة العربية باحترافية."
+                    f"أجب بنصوص صافية بدون رموز تنسيق معقدة."
                 )
                 res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=eval_prompt)
                 evaluation_result = res.text
 
                 save_to_memory(MEMORY_FILE, f"رابط يوتيوب: {video_link}\nالتحليل والتصنيف:\n{evaluation_result}")
 
-                response_text = f"📊 <b>نتيجة تحليل وتصنيف الاستراتيجية الجديدة:</b>\n\n{evaluation_result}"
+                response_text = f"نتيجة تحليل وتصنيف الاستراتيجية الجديدة:\n\n{evaluation_result}"
                 if len(response_text) > 4000:
                     response_text = response_text[:4000]
 
-                await message.answer(response_text, parse_mode="HTML")
+                await message.answer(response_text)
                 return
             except Exception as e:
-                await message.answer(f"❌ حدث خطأ: {str(e)}")
+                await message.answer(f"حدث خطأ: {str(e)}")
         return
     else:
-        # معالجة الأخبار المحولة
         if ai_client:
             try:
                 news_prompt = (
-                    f"هذا خبر تم توجيهه من قناة إخبارية:\n\"{text}\"\n\n"
-                    f"قم بتحليله باختصار واذكر: 1) ملخص الخبر. 2) تأثيره على الأسواق (إيجابي صعودي / سلبي هبوطي / محايد)."
+                    f"هذا خبر تم توجيهه:\n\"{text}\"\n\n"
+                    f"قم بتحليله باختصار واذكر: 1) ملخص الخبر. 2) تأثيره على الأسواق."
                 )
                 res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=news_prompt)
                 news_analysis = res.text
@@ -250,16 +245,15 @@ async def handle_any_message(message: types.Message):
                 save_to_memory(NEWS_FILE, f"الخبر الأصلي: {text}\nالتحليل الآلي: {news_analysis}")
                 
                 response_alert = (
-                    f"⚡ <b>تم رصد وتحليل الخبر أوتوماتيكياً!</b>\n\n"
-                    f"📌 <b>التأثير:</b>\n{news_analysis}\n\n"
-                    f"<i>✅ سيتم اعتماده في المراجعة الذاتية للتقارير القادمة.</i>"
+                    f"تم رصد وتحليل الخبر أوتوماتيكياً!\n\n"
+                    f"التأثير:\n{news_analysis}"
                 )
-                await message.answer(response_alert, parse_mode="HTML")
+                await message.answer(response_alert)
                 return
             except Exception:
                 pass
         
-        await message.answer("أهلاً يا زعيم! البوت يقوم بالمراجعة الذاتية والتصنيف وإرسال الصفقات مع مدتها الزمنية بدقة أوتوماتيكياً.", parse_mode="HTML")
+        await message.answer("البوت يعمل بانتظام وجاهز لاستقبال الروابط أو الأوامر يا زعيم.")
 
 async def main():
     await start_web_server()
