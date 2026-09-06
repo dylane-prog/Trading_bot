@@ -48,6 +48,28 @@ async def fetch_live_prices():
         pass
     return {"BTC": 79800, "ETH": 2470}
 
+def clean_and_keep_top_strategies(ai_client, memory_content):
+    """يستخدم الذكاء الاصطناعي لترتيب الاستراتيجيات والاحتفاظ بأفضل 5 فقط."""
+    if not memory_content.strip() or not ai_client:
+        return memory_content
+    
+    prompt = (
+        f"لديك قائمة الاستراتيجيات التالية المسجلة في الذاكرة:\n{memory_content}\n\n"
+        f"المطلوب:\n"
+        f"1. قم بتحليله وترتيب الاستراتيجيات حسب نسبة النجاح والأرباح المتوقعة.\n"
+        f"2. احتفظ فقط **بأفضل 5 استراتيجيات** تثبت كفاءة عالية وأرباحاً قوية.\n"
+        f"3. احذف تماماً أي استراتيجيات ضعيفة أو مكررة.\n"
+        f"4. اعطني النتيجة مرتبة بوضوح بحيث تحتوي فقط على أقوى 5 استراتيجيات مع تفاصيلها باختصار."
+    )
+    try:
+        response = ai_client.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=prompt,
+        )
+        return response.text
+    except Exception:
+        return memory_content
+
 async def generate_market_report():
     if not ai_client:
         return "⚠️ مفتاح الذكاء الاصطناعي غير مضبوط."
@@ -56,6 +78,11 @@ async def generate_market_report():
     if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             memory_content = f.read()
+
+    # تصفية الذاكرة والاحتفاظ بأفضل 5 استراتيجيات فقط تلقائياً
+    cleaned_memory = clean_and_keep_top_strategies(ai_client, memory_content)
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        f.write(cleaned_memory)
 
     news_content = "لا توجد أخبار مسجلة."
     if os.path.exists(NEWS_FILE):
@@ -81,14 +108,14 @@ async def generate_market_report():
 
     prompt = (
         f"أنت مدير تداول آلي ذكي وخبير استراتيجي. مهمتك مراجعة الأداء السابق واستنتاج الاستراتيجيات الأصح نسبياً.\n\n"
-        f"1. مكتبة الاستراتيجيات المخزنة:\n{memory_content}\n\n"
+        f"1. أفضل 5 استراتيجيات معتمدة حالياً:\n{cleaned_memory}\n\n"
         f"2. سجل الصفقات والتقييمات الذاتية السابقة:\n{trades_history}\n\n"
         f"3. أحدث الأخبار المرصودة:\n{news_content}\n\n"
         f"4. حالة السوق الحالية: {market_condition_note}\n"
         f"5. الأسعار الحية للكريبتو: BTC = ${btc_price}, ETH = ${eth_price}\n\n"
         f"المطلوب تقرير صفقات تنفيذي دقيق:\n"
         f"- تصنيف الاستراتيجيات المستخدمة حسب كفاءتها.\n"
-        f"- عند إعطاء أي صفقة مقترحة، **يجب أن تتضمن عدة مستويات لجني الأرباح (TP1, TP2, TP3)** بدلاً من هدف واحد، مع تحديد نسبة الخروج عند كل هدف.\n"
+        f"- عند إعطاء أي صفقة مقترحة، يجب أن تتضمن عدة مستويات لجني الأرباح (TP1, TP2, TP3) مع تحديد نسبة الخروج عند كل هدف.\n"
         f"- يجب تحديد مدة تحقيق الصفقة بدقة ضمن نطاق حصري بين دقيقة واحدة (1m) و 72 ساعة (72h).\n"
         f"- أجب بنصوص صافية بدون رموز تنسيق HTML معقدة."
     )
@@ -132,8 +159,8 @@ async def cmd_start(message: types.Message):
 
     welcome_text = (
         "مرحباً بك يا زعيم ديلان في نظام التداول الذاتي والمراجعة الذكية!\n\n"
-        "• يراجع البوت الصفقات ويصنف الاستراتيجيات أوتوماتيكياً.\n"
-        "• كل صفقة تتضمن الآن **عدة أهداف لجني الأرباح (TP1, TP2, TP3)** ومدد زمنية دقيقة."
+        "• البوت يراجع الصفقات ويقوم تلقائياً بـ **فلترة الاستراتيجيات والاحتفاظ بأفضل 5 استراتيجيات ربحية فقط**.\n"
+        "• كل صفقة تتضمن عدة أهداف لجني الأرباح (TP1, TP2, TP3) ومدد زمنية دقيقة."
     )
     await message.answer(welcome_text)
 
@@ -145,7 +172,7 @@ async def cmd_strategies(message: types.Message):
         if content.strip():
             if len(content) > 3000:
                 content = content[-3000:]
-            await message.answer(f"مكتبة الاستراتيجيات المصنفة:\n\n{content}")
+            await message.answer(f"أفضل 5 استراتيجيات معتمدة حالياً:\n\n{content}")
             return
     await message.answer("لا توجد استراتيجيات مخزنة بعد.")
 
@@ -166,7 +193,7 @@ async def cmd_analyze(message: types.Message):
     with open("last_chat_id.txt", "w") as f:
         f.write(str(message.chat.id))
 
-    await message.answer("جاري مراجعة الأداء وتوليد الصفقات بأهداف متعددة لجني الأرباح...")
+    await message.answer("جاري مراجعة الأداء، فلترة الذاكرة لأفضل 5 استراتيجيات، وتوليد الصفقات...")
     report = await generate_market_report()
     response_text = f"التقرير التنفيذي المصنف والمراجع ذاتياً:\n\n{report}"
     if len(response_text) > 4000:
@@ -205,7 +232,7 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
 
-        await message.answer("جاري تحليل الاستراتيجية وإخضاعها للباك تست...")
+        await message.answer("جاري تحليل الاستراتيجية وإخضاعها للتقييم...")
 
         if ai_client:
             try:
@@ -213,8 +240,8 @@ async def handle_any_message(message: types.Message):
                     f"بناءً على نص الفيديو المستخرج التالي:\n\"{transcript_text}\"\n\n"
                     f"قم بالآتي:\n"
                     f"1. اقترح اسماً للاستراتيجية وحدد تصنيفها.\n"
-                    f"2. قم بعمل محاكاة لجدول كفاءتها.\n"
-                    f"3. اكتب كود برمجي بـ (Pine Script v5) مع وضع مستويات أهداف متعددة (TP1, TP2, TP3).\n"
+                    f"2. قم بعمل محاكاة لجدول كفاءتها وأرباحها المتوقعة.\n"
+                    f"3. اكتب ملخصاً استراتيجياً واضحاً.\n"
                     f"أجب بنصوص صافية."
                 )
                 res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=eval_prompt)
@@ -222,7 +249,14 @@ async def handle_any_message(message: types.Message):
 
                 save_to_memory(MEMORY_FILE, f"رابط يوتيوب: {video_link}\nالتحليل:\n{evaluation_result}")
 
-                response_text = f"نتيجة تحليل الاستراتيجية:\n\n{evaluation_result}"
+                # بعد إضافة استراتيجية جديدة، نقوم فوراً بتحديث وفلترة الذاكرة لأفضل 5 فقط
+                with open(MEMORY_FILE, "r", encoding="utf-8") as mf:
+                    current_mem = mf.read()
+                cleaned_mem = clean_and_keep_top_strategies(ai_client, current_mem)
+                with open(MEMORY_FILE, "w", encoding="utf-8") as mf:
+                    mf.write(cleaned_mem)
+
+                response_text = f"تمت إضافة وتحليل الاستراتيجية بنجاح وتمت فلترة الذاكرة لأفضل الاستراتيجيات:\n\n{evaluation_result}"
                 if len(response_text) > 4000:
                     response_text = response_text[:4000]
 
@@ -248,7 +282,7 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
         
-        await message.answer("البوت جاهز. أرسل `/analyze` لرؤية الأهداف المتعددة لجني الأرباح الآن.")
+        await message.answer("البوت جاهز. أرسل `/strategies` لرؤية أفضل 5 استراتيجيات معتمدة حالياً.")
 
 async def main():
     await start_web_server()
