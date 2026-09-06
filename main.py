@@ -88,8 +88,9 @@ async def generate_market_report():
         f"5. الأسعار الحية للكريبتو: BTC = ${btc_price}, ETH = ${eth_price}\n\n"
         f"المطلوب تقرير صفقات تنفيذي دقيق:\n"
         f"- تصنيف الاستراتيجيات المستخدمة حسب كفاءتها.\n"
-        f"- عند إعطاء أي صفقة مقترحة، يجب تحديد مدة تحقيق الصفقة بدقة ضمن نطاق حصري بين دقيقة واحدة (1m) و 72 ساعة (72h).\n"
-        f"- تجنب نهائياً استخدام أي رموز برمجية HTML معقدة لكي لا تحدث أخطاء في العرض."
+        f"- عند إعطاء أي صفقة مقترحة، **يجب أن تتضمن عدة مستويات لجني الأرباح (TP1, TP2, TP3)** بدلاً من هدف واحد، مع تحديد نسبة الخروج عند كل هدف.\n"
+        f"- يجب تحديد مدة تحقيق الصفقة بدقة ضمن نطاق حصري بين دقيقة واحدة (1m) و 72 ساعة (72h).\n"
+        f"- أجب بنصوص صافية بدون رموز تنسيق HTML معقدة."
     )
 
     try:
@@ -118,7 +119,6 @@ async def hourly_background_reporter():
                     full_msg = f"التقرير التلقائي الساعي:\n\n{report}"
                     if len(full_msg) > 4000:
                         full_msg = full_msg[:4000]
-                    # إرسال بدون parse_mode لتجنب أي أخطاء في الرموز
                     await bot.send_message(chat_id=int(chat_id), text=full_msg)
         except Exception as e:
             logging.error(f"Error in background reporter: {e}")
@@ -132,9 +132,8 @@ async def cmd_start(message: types.Message):
 
     welcome_text = (
         "مرحباً بك يا زعيم ديلان في نظام التداول الذاتي والمراجعة الذكية!\n\n"
-        "• يراجع البوت الصفقات ويصنف الاستراتيجيات الأصح نسبياً أوتوماتيكياً.\n"
-        "• كل صفقة مقترحة تتضمن مدة التحقيق بدقة (بين دقيقة واحدة و 72 ساعة كحد أقصى).\n"
-        "• إرسال التقارير التلقائية كل ساعة في الخلفية دون أخطاء."
+        "• يراجع البوت الصفقات ويصنف الاستراتيجيات أوتوماتيكياً.\n"
+        "• كل صفقة تتضمن الآن **عدة أهداف لجني الأرباح (TP1, TP2, TP3)** ومدد زمنية دقيقة."
     )
     await message.answer(welcome_text)
 
@@ -167,7 +166,7 @@ async def cmd_analyze(message: types.Message):
     with open("last_chat_id.txt", "w") as f:
         f.write(str(message.chat.id))
 
-    await message.answer("جاري مراجعة الأداء، تصنيف الاستراتيجيات، وتوليد صفقات مدتها محسوبة بدقة...")
+    await message.answer("جاري مراجعة الأداء وتوليد الصفقات بأهداف متعددة لجني الأرباح...")
     report = await generate_market_report()
     response_text = f"التقرير التنفيذي المصنف والمراجع ذاتياً:\n\n{report}"
     if len(response_text) > 4000:
@@ -206,24 +205,24 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
 
-        await message.answer("جاري تحليل الاستراتيجية، إخضاعها للباك تست، وتصنيفها في الذاكرة الذكية...")
+        await message.answer("جاري تحليل الاستراتيجية وإخضاعها للباك تست...")
 
         if ai_client:
             try:
                 eval_prompt = (
                     f"بناءً على نص الفيديو المستخرج التالي:\n\"{transcript_text}\"\n\n"
                     f"قم بالآتي:\n"
-                    f"1. اقترح اسماً للاستراتيجية وحدد تصنيفها الأولي.\n"
-                    f"2. قم بعمل محاكاة لجدول كفاءتها (Win Rate & Profit Factor).\n"
-                    f"3. اكتب كود برمجي مجاني بـ (Pine Script v5) لتطبيقها على TradingView.\n"
-                    f"أجب بنصوص صافية بدون رموز تنسيق معقدة."
+                    f"1. اقترح اسماً للاستراتيجية وحدد تصنيفها.\n"
+                    f"2. قم بعمل محاكاة لجدول كفاءتها.\n"
+                    f"3. اكتب كود برمجي بـ (Pine Script v5) مع وضع مستويات أهداف متعددة (TP1, TP2, TP3).\n"
+                    f"أجب بنصوص صافية."
                 )
                 res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=eval_prompt)
                 evaluation_result = res.text
 
-                save_to_memory(MEMORY_FILE, f"رابط يوتيوب: {video_link}\nالتحليل والتصنيف:\n{evaluation_result}")
+                save_to_memory(MEMORY_FILE, f"رابط يوتيوب: {video_link}\nالتحليل:\n{evaluation_result}")
 
-                response_text = f"نتيجة تحليل وتصنيف الاستراتيجية الجديدة:\n\n{evaluation_result}"
+                response_text = f"نتيجة تحليل الاستراتيجية:\n\n{evaluation_result}"
                 if len(response_text) > 4000:
                     response_text = response_text[:4000]
 
@@ -237,23 +236,19 @@ async def handle_any_message(message: types.Message):
             try:
                 news_prompt = (
                     f"هذا خبر تم توجيهه:\n\"{text}\"\n\n"
-                    f"قم بتحليله باختصار واذكر: 1) ملخص الخبر. 2) تأثيره على الأسواق."
+                    f"قم بتحليله باختصار واذكر تأثيره على الأسواق."
                 )
                 res = ai_client.models.generate_content(model='gemini-3.6-flash', contents=news_prompt)
                 news_analysis = res.text
                 
-                save_to_memory(NEWS_FILE, f"الخبر الأصلي: {text}\nالتحليل الآلي: {news_analysis}")
+                save_to_memory(NEWS_FILE, f"الخبر الأصلي: {text}\nالتحليل: {news_analysis}")
                 
-                response_alert = (
-                    f"تم رصد وتحليل الخبر أوتوماتيكياً!\n\n"
-                    f"التأثير:\n{news_analysis}"
-                )
-                await message.answer(response_alert)
+                await message.answer(f"تم رصد وتحليل الخبر:\n\n{news_analysis}")
                 return
             except Exception:
                 pass
         
-        await message.answer("البوت يعمل بانتظام وجاهز لاستقبال الروابط أو الأوامر يا زعيم.")
+        await message.answer("البوت جاهز. أرسل `/analyze` لرؤية الأهداف المتعددة لجني الأرباح الآن.")
 
 async def main():
     await start_web_server()
