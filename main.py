@@ -9,20 +9,41 @@ from youtube_transcript_api import YouTubeTranscriptApi
 import google.genai as genai
 
 TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+# قراءة جميع المفاتيح مفصولة بـفاصلة وفصلها في قائمة
+GEMINI_KEYS_RAW = os.getenv("GEMINI_API_KEYS", "")
+GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS_RAW.split(",") if k.strip()]
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
+# نظام إدارة وتدوير المفاتيح (Key Rotator)
+class KeyManager:
+    def __init__(self, keys):
+        self.keys = keys
+        self.current_index = 0
+
+    def get_client(self):
+        if not self.keys:
+            return None
+        key = self.keys[self.current_index]
+        return genai.Client(api_key=key)
+
+    def rotate_key(self):
+        if len(self.keys) > 1:
+            old_index = self.current_index
+            self.current_index = (self.current_index + 1) % len(self.keys)
+            logging.warning(f"🔄 تم تبديل مفتاح الذكاء الاصطناعي تلقائياً من الحساب رقم {old_index + 1} إلى الحساب رقم {self.current_index + 1}")
+
+key_manager = KeyManager(GEMINI_KEYS)
+
 MEMORY_FILE = "strategies_memory.txt"
 NEWS_FILE = "news_memory.txt"
 TRADES_LOG_FILE = "trades_performance_log.txt"
 
 async def handle(request):
-    return web.Response(text="Fully Autonomous Smart Trading & Protected Bot is active 24/7!")
+    return web.Response(text="Multi-Key Autonomous Trading Bot is active 24/7!")
 
 app = web.Application()
 app.add_routes([web.get('/', handle)])
@@ -34,14 +55,18 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-async def safe_generate_content(prompt, model='gemini-3.6-flash', retries=3, delay=15):
-    """دالة ذكية لحماية طلبات الذكاء الاصطناعي وإعادة المحاولة تلقائياً عند حدوث ضغط أو خطأ 429."""
-    if not ai_client:
+async def safe_generate_content(prompt, model='gemini-3.6-flash', retries=3, delay=5):
+    """دالة ذكية تحاول بالعميل الحالي، وإذا واجهت 429 تتبدل للمفتاح التالي فوراً وتكرر المحاولة."""
+    if not GEMINI_KEYS:
         return None
     
-    for attempt in range(retries):
+    total_keys = len(GEMINI_KEYS)
+    for attempt in range(retries * total_keys):
+        client = key_manager.get_client()
+        if not client:
+            return None
         try:
-            response = ai_client.models.generate_content(
+            response = client.models.generate_content(
                 model=model,
                 contents=prompt,
             )
@@ -49,12 +74,11 @@ async def safe_generate_content(prompt, model='gemini-3.6-flash', retries=3, del
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "503" in error_str:
-                if attempt < retries - 1:
-                    logging.warning(f"تم الوصول لحد الطلبات (Rate Limit). جاري إعادة المحاولة بعد {delay} ثانية... (المحاولة {attempt + 1}/{retries})")
-                    await asyncio.sleep(delay)
-                    delay *= 2  # مضاعفة وقت الانتظار تدريجياً
-                    continue
-            logging.error(f"خطأ في توليد الذكاء الاصطناعي: {error_str}")
+                logging.warning(f"المفتاح الحالي استنفد حصته أو واجه ضغطاً. جاري التبديل للمفتاح التالي...")
+                key_manager.rotate_key()
+                await asyncio.sleep(2)
+                continue
+            logging.error(f"خطأ غير متوقع في الذكاء الاصطناعي: {error_str}")
             return None
     return None
 
@@ -101,7 +125,7 @@ async def fetch_live_prices():
     return {"BTC": 79800, "ETH": 2470}
 
 async def clean_and_keep_top_strategies(memory_content):
-    if not memory_content.strip() or not ai_client:
+    if not memory_content.strip() or not GEMINI_KEYS:
         return memory_content
     
     prompt = (
@@ -116,8 +140,8 @@ async def clean_and_keep_top_strategies(memory_content):
     return result if result else memory_content
 
 async def generate_market_report():
-    if not ai_client:
-        return "⚠️ مفتاح الذكاء الاصطناعي غير مضبوط."
+    if not GEMINI_KEYS:
+        return "⚠️ مفاتيح الذكاء الاصطناعي غير مضبوطة."
         
     memory_content = "لا توجد استراتيجيات مسجلة."
     if os.path.exists(MEMORY_FILE):
@@ -165,10 +189,10 @@ async def generate_market_report():
 
     report_text = await safe_generate_content(prompt)
     if not report_text:
-        return "⚠️ نعتذر، خوادم الذكاء الاصطناعي تشهد ضغطاً عالياً حالياً. يرجى المحاولة بعد قليل."
+        return "⚠️ حدث ضغط على جميع الحسابات، يرجى المحاولة بعد قليل."
         
     with open(TRADES_LOG_FILE, "a", encoding="utf-8") as log_f:
-        log_f.write(f"--- تقييم وباكتست تلقائي [{now.strftime('%Y-%m-%d %H:%M')}] ---\n{report_text[:500]}...\n\n")
+        log_f.write(f"--- تقييم وباكتست تلقائي بخطوط متعددة [{now.strftime('%Y-%m-%d %H:%M')}] ---\n{report_text[:500]}...\n\n")
         
     return report_text
 
@@ -181,14 +205,13 @@ async def hourly_background_reporter():
                     chat_id = f.read().strip()
                 if chat_id:
                     report = await generate_market_report()
-                    full_msg = f"التقرير التلقائي المحمي:\n\n{report}"
+                    full_msg = f"التقرير التلقائي (نظام تعدد الحسابات):\n\n{report}"
                     if len(full_msg) > 4000:
                         full_msg = full_msg[:4000]
                     await bot.send_message(chat_id=int(chat_id), text=full_msg)
         except Exception as e:
             logging.error(f"Error in background reporter: {e}")
         
-        # زيادة الفاصل الزمني إلى ساعتين (7200 ثانية) لتخفيف الضغط تماماً عن الحصة المجانية
         await asyncio.sleep(7200)
 
 @dp.message(Command("start"))
@@ -197,10 +220,10 @@ async def cmd_start(message: types.Message):
         f.write(str(message.chat.id))
 
     welcome_text = (
-        "مرحباً بك يا زعيم ديلان في نظام التداول المحمي الذكي!\n\n"
-        "• تفعيل نظام الحماية الذاتي ضد ضغط الخوادم (Rate Limit Protection).\n"
-        "• الباكتست الحقيقي وفلترة أفضل 5 استراتيجيات يعملان بكفاءة.\n"
-        "• التقرير التلقائي أصبح كل ساعتين لضمان استقرار العمل دون توقف."
+        f"مرحباً بك يا زعيم ديلان في النظام الخارق لنظام التداول المتعدد الحسابات!\n\n"
+        f"• تم ربط {len(GEMINI_KEYS)} حسابات/مفاتيح ذكاء اصطناعي بنجاح.\n"
+        f"• إذا امتلأ حساب، ينتقل البوت تلقائياً للحساب الذي يليه دون أن يتوقف أبداً.\n"
+        f"• الباكتست والتقارير والسحب تعمل بأعلى كفاءة."
     )
     await message.answer(welcome_text)
 
@@ -212,7 +235,7 @@ async def cmd_strategies(message: types.Message):
         if content.strip():
             if len(content) > 3000:
                 content = content[-3000:]
-            await message.answer(f"أفضل 5 استراتيجيات معتمدة (بعد الباكتست):\n\n{content}")
+            await message.answer(f"أفضل 5 استراتيجيات معتمدة:\n\n{content}")
             return
     await message.answer("لا توجد استراتيجيات مخزنة بعد.")
 
@@ -224,7 +247,7 @@ async def cmd_news(message: types.Message):
         if news_content.strip():
             if len(news_content) > 3000:
                 news_content = news_content[-3000:]
-            await message.answer(f"أرشيف الأخبار والتحليلات:\n\n{news_content}")
+            await message.answer(f"أرشيف الأخبار:\n\n{news_content}")
             return
     await message.answer("لا توجد أخبار مسجلة حالياً.")
 
@@ -233,9 +256,9 @@ async def cmd_analyze(message: types.Message):
     with open("last_chat_id.txt", "w") as f:
         f.write(str(message.chat.id))
 
-    await message.answer("جاري تنفيذ الباكتست وفلترة الاستراتيجيات بنظام الحماية الآمن...")
+    await message.answer("جاري تشغيل التحليل والباكتست باستخدام شبكة الحسابات المترابطة...")
     report = await generate_market_report()
-    response_text = f"التقرير التنفيذي الآمن:\n\n{report}"
+    response_text = f"التقرير التنفيذي الشامل:\n\n{report}"
     if len(response_text) > 4000:
         response_text = response_text[:4000]
     await message.answer(response_text)
@@ -272,9 +295,9 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
 
-        await message.answer("جاري استخراج وتحليل الفيديو وتطبيق الباكتست (قد تستغرق المحاولة الآمنة بضع ثوانٍ)...")
+        await message.answer("جاري تحليل الفيديو والباكتست عبر شبكة الحسابات التلقائية...")
 
-        if ai_client:
+        if GEMINI_KEYS:
             try:
                 historical_prices = await fetch_historical_candles()
                 backtest_results = await run_backtest_simulation(transcript_text, historical_prices)
@@ -291,7 +314,7 @@ async def handle_any_message(message: types.Message):
                 
                 evaluation_result = await safe_generate_content(eval_prompt)
                 if not evaluation_result:
-                    await message.answer("⚠️ حدث ضغط مؤقت في الخوادم، يرجى إعادة إرسال الرابط بعد قليل.")
+                    await message.answer("⚠️ حدث ضغط على جميع الحسابات المتاحة، حاول بعد قليل.")
                     return
 
                 save_to_memory(MEMORY_FILE, f"رابط يوتيوب: {video_link}\nنتيجة الباكتست: Win Rate {backtest_results['win_rate']}%\nالتفاصيل:\n{evaluation_result}")
@@ -312,7 +335,7 @@ async def handle_any_message(message: types.Message):
                 await message.answer(f"حدث خطأ: {str(e)}")
         return
     else:
-        if ai_client:
+        if GEMINI_KEYS:
             try:
                 news_prompt = (
                     f"هذا خبر تم توجيهه:\n\"{text}\"\n\n"
@@ -326,7 +349,7 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
         
-        await message.answer("البوت جاهز وبحالة آمنة. أرسل `/analyze` لرؤية التقرير.")
+        await message.answer("البوت يعمل بنظام الحسابات المتعددة. أرسل `/analyze` للتقرير.")
 
 async def main():
     await start_web_server()
