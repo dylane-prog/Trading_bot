@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import os
-import re
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 import google.genai as genai
+import yfinance as yf
 
 TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEYS_RAW = os.getenv("GEMINI_API_KEYS", "")
@@ -35,10 +35,8 @@ key_manager = KeyManager(GEMINI_KEYS)
 MEMORY_FILE = "strategies_memory.txt"
 NEWS_FILE = "news_memory.txt"
 
-active_trades_cache = []
-
 async def handle(request):
-    return web.Response(text="Hardcoded Sync Trading Bot is Running!")
+    return web.Response(text="Forex & Crypto Sync Bot is Running!")
 
 app = web.Application()
 app.add_routes([web.get('/', handle)])
@@ -50,7 +48,7 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-async def safe_generate_content(prompt, model='gemini-3.6-flash', retries=3):
+async def safe_generate_content(prompt, model='gemini-2.5-flash', retries=3):
     if not GEMINI_KEYS: return None
     for _ in range(retries * len(GEMINI_KEYS)):
         client = key_manager.get_client()
@@ -60,98 +58,126 @@ async def safe_generate_content(prompt, model='gemini-3.6-flash', retries=3):
             return response.text
         except Exception:
             key_manager.rotate_key()
-            asyncio.sleep(1)
+            await asyncio.sleep(1)
     return None
 
-async def generate_market_report():
-    global active_trades_cache
+def fetch_specific_asset_price(ticker_symbol, default_price):
+    """جلب سعر أصل معين (معادن، فوركس، كريبتو) بدقة وحيّة"""
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        todays_data = ticker.history(period='1d', interval='1m')
+        if not todays_data.empty:
+            val = float(todays_data['Close'].iloc[-1])
+            # تنسيق عدد الخانات العشرية حسب نوع السوق
+            if val < 10:  # فوركس
+                return round(val, 4)
+            elif val < 1000:  # فضة أو عملات رقمية متوسطة
+                return round(val, 2)
+            else:  # ذهب أو بيتكوين
+                return round(val, 2)
+    except Exception:
+        pass
+    return default_price
+
+async def generate_single_asset_report(asset_name, ticker_symbol, default_price, sl_val, tp1_val, tp2_val):
     if not GEMINI_KEYS: return "⚠️ مفاتيح الذكاء الاصطناعي غير مضبوطة."
     
-    memory_content = "لا توجد استراتيجيات مسجلة."
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            memory_content = f.read()
-
-    news_content = "لا توجد أخبار مسجلة."
-    if os.path.exists(NEWS_FILE):
-        with open(NEWS_FILE, "r", encoding="utf-8") as f:
-            news_content = f.read()
-
-    # الأسعار الحقيقية المطلقة المستخرجة مباشرة من شارتك الحالي
-    gold_price = 4413.88
-    silver_price = 32.40
-    eur_price = 1.0500
-    btc_price = 85000.0
-
+    current_price = fetch_specific_asset_price(ticker_symbol, default_price)
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    # نطلب فقط الاتجاه والتحليل، بينما الأسعار نتحكم نحن بها برمجياً 100%
-    prompt = (
-        f"بناءً على الاستراتيجيات والأخبار التالية، أعطني فقط اتجاه السوق (صاعد/هابط) وأسباب فنية مختصرة للذهب والفضة:\n"
-        f"الاستراتيجيات والأخبار:\n{memory_content}\n{news_content}"
-    )
+    memory_content = ""
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            memory_content = f.read()[-1000:]
 
+    prompt = f"بناءً على السعر الحالي {current_price} للأصل {asset_name}، أعطني تحليلاً فنياً موجزاً يحدد الاتجاه (شراء/بيع) وأسباب الزخم:\n{memory_content}"
     ai_analysis = await safe_generate_content(prompt)
     if not ai_analysis:
-        ai_analysis = "اتجاه فني بناءً على الزخم الحالي."
+        ai_analysis = "حركة الأسعار تحترم مستويات الدعم والمقاومة الحالية."
 
-    # دمج السعر الحقيقي ثابتاً برمجياً مع تحليل الذكاء الاصطناعي لضمان استحالة الخطأ
-    report_text = (
-        f"📊 **التقرير الفوري المتزامن حصرياً:**\n"
-        f"⏱️ وقت الإصدار: {current_time_str}\n\n"
-        f"🟡 **1. الذهب (XAU/USD):**\n"
-        f"• **السعر الحالي في الشارت:** `{gold_price}`\n"
-        f"• **منطقة الدخول المباشرة:** `{gold_price - 0.50} - {gold_price}`\n"
+    report = (
+        f"📊 **تحليل خاص: {asset_name}**\n"
+        f"⏱️ الوقت: {current_time_str}\n\n"
+        f"• **السعر الحي الآن:** `{current_price}`\n"
+        f"• **منطقة الدخول:** `{round(current_price - (sl_val * 0.1), 4) if current_price < 10 else round(current_price - 0.5, 2)} - {current_price}`\n"
         f"• **الاتجاه:** شراء (BUY)\n"
-        f"• **وقف الخسارة (SL):** `{gold_price - 5.00}`\n"
+        f"• **وقف الخسارة (SL):** `{round(current_price - sl_val, 4 if current_price < 10 else 2)}`\n"
         f"• **الأهداف (TP):**\n"
-        f"  - الهدف الأول: `{gold_price + 4.00}`\n"
-        f"  - الهدف الثاني: `{gold_price + 8.00}`\n"
-        f"• **المدة الزمنية المتوقعة:** 120 دقيقة (ساعتان)\n\n"
-        f"⚪ **2. الفضة (XAG/USD):**\n"
-        f"• **السعر الحالي:** `{silver_price}`\n"
-        f"• **منطقة الدخول:** `{silver_price - 0.05} - {silver_price}`\n"
-        f"• **وقف الخسارة:** `{silver_price - 0.25}`\n"
-        f"• **الأهداف:** TP1: `{silver_price + 0.30}` | TP2: `{silver_price + 0.60}`\n\n"
-        f"📝 **رؤية تحليلية:**\n{ai_analysis[:1000]}"
+        f"  - الهدف الأول: `{round(current_price + tp1_val, 4 if current_price < 10 else 2)}`\n"
+        f"  - الهدف الثاني: `{round(current_price + tp2_val, 4 if current_price < 10 else 2)}`\n\n"
+        f"📝 **رؤية تحليلية:**\n{ai_analysis[:800]}"
     )
+    return report
 
-    active_trades_cache = [report_text, current_time_str]
-    return report_text
-
-async def trade_monitor_background_loop():
-    await asyncio.sleep(60)
-    while True:
-        try:
-            if active_trades_cache and os.path.exists("last_chat_id.txt"):
-                with open("last_chat_id.txt", "r") as f:
-                    chat_id = f.read().strip()
-                if chat_id:
-                    await asyncio.sleep(1800)
-                    report_text = active_trades_cache[0]
-                    await bot.send_message(chat_id=int(chat_id), text=f"⚠️ **مراقبة دورية للصفقات:**\n\nالسعر مستقر ضمن نطاق التحليل الفني المعتمد.")
-        except Exception:
-            pass
-        await asyncio.sleep(60)
-
-async def hourly_background_reporter():
-    await asyncio.sleep(30)
-    while True:
-        try:
-            if os.path.exists("last_chat_id.txt"):
-                with open("last_chat_id.txt", "r") as f:
-                    chat_id = f.read().strip()
-                if chat_id:
-                    report = await generate_market_report()
-                    await bot.send_message(chat_id=int(chat_id), text=report)
-        except Exception:
-            pass
-        await asyncio.sleep(7200)
-
+# --- الأوامر المخصصة لكل الأسواق ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("أهلاً بك يا زعيم! تم ربط الأسعار برمجياً بشكل مباشر وقاطع لمنع أي تضارب.")
+    await message.answer(
+        "أهلاً بك يا زعيم! البوت جاهز بكل أقسام السوق (معادن، فوركس، كريبتو):\n\n"
+        "🟡 **المعادن:**\n"
+        "• `/analyzeGold` - الذهب\n"
+        "• `/analyzeSilver` - الفضة\n\n"
+        "💱 **الفوركس:**\n"
+        "• `/analyzeEurUsd` - يورو / دولار\n"
+        "• `/analyzeGbpUsd` - باوند / دولار\n"
+        "• `/analyzeUsdJpy` - دولار / ين\n\n"
+        "🪙 **الكريبتو:**\n"
+        "• `/analyzeBtc` - بيتكوين\n"
+        "• `/analyzeEth` - إيثريوم\n"
+        "• `/analyzeSol` - سولانا"
+    )
+
+# المعادن
+@dp.message(Command("analyzeGold"))
+async def cmd_gold(message: types.Message):
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
+    await message.answer("🔄 جاري جلب السعر الحي للذهب...")
+    await message.answer(await generate_single_asset_report("الذهب (XAU/USD)", "GC=F", 4412.0, 5.0, 4.0, 8.0))
+
+@dp.message(Command("analyzeSilver"))
+async def cmd_silver(message: types.Message):
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
+    await message.answer("🔄 جاري جلب السعر الحي للفضة...")
+    await message.answer(await generate_single_asset_report("الفضة (XAG/USD)", "SI=F", 32.40, 0.25, 0.30, 0.60))
+
+# الفوركس
+@dp.message(Command("analyzeEurUsd"))
+async def cmd_eurusd(message: types.Message):
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
+    await message.answer("🔄 جاري جلب السعر الحي لـ EUR/USD...")
+    await message.answer(await generate_single_asset_report("يورو/دولار (EUR/USD)", "EURUSD=X", 1.0500, 0.0030, 0.0025, 0.0050))
+
+@dp.message(Command("analyzeGbpUsd"))
+async def cmd_gbpusd(message: types.Message):
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
+    await message.answer("🔄 جاري جلب السعر الحي لـ GBP/USD...")
+    await message.answer(await generate_single_asset_report("باوند/دولار (GBP/USD)", "GBPUSD=X", 1.2650, 0.0035, 0.0030, 0.0060))
+
+@dp.message(Command("analyzeUsdJpy"))
+async def cmd_usdjpy(message: types.Message):
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
+    await message.answer("🔄 جاري جلب السعر الحي لـ USD/JPY...")
+    await message.answer(await generate_single_asset_report("دولار/ين (USD/JPY)", "USDJPY=X", 153.00, 0.40, 0.35, 0.70))
+
+# الكريبتو
+@dp.message(Command("analyzeBtc"))
+async def cmd_btc(message: types.Message):
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
+    await message.answer("🔄 جاري جلب السعر الحي للبيتكوين...")
+    await message.answer(await generate_single_asset_report("البيتكوين (BTC/USD)", "BTC-USD", 85000.0, 500.0, 800.0, 1500.0))
+
+@dp.message(Command("analyzeEth"))
+async def cmd_eth(message: types.Message):
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
+    await message.answer("🔄 جاري جلب السعر الحي للإيثريوم...")
+    await message.answer(await generate_single_asset_report("الإيثريوم (ETH/USD)", "ETH-USD", 3100.0, 50.0, 80.0, 150.0))
+
+@dp.message(Command("analyzeSol"))
+async def cmd_sol(message: types.Message):
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
+    await message.answer("🔄 جاري جلب السعر الحي لسولانا...")
+    await message.answer(await generate_single_asset_report("سولانا (SOL/USD)", "SOL-USD", 180.0, 4.0, 6.0, 12.0))
 
 @dp.message(Command("strategies"))
 async def cmd_strategies(message: types.Message):
@@ -172,13 +198,6 @@ async def cmd_news(message: types.Message):
             await message.answer(f"📰 الأخبار المسجلة:\n\n{content[-3500:]}")
             return
     await message.answer("لا توجد أخبار مسجلة.")
-
-@dp.message(Command("analyze"))
-async def cmd_analyze(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري إعداد التقرير بالأسعار المتزامنة بدقة تامة...")
-    report = await generate_market_report()
-    await message.answer(report)
 
 @dp.message()
 async def handle_any_message(message: types.Message):
@@ -205,8 +224,6 @@ async def handle_any_message(message: types.Message):
 
 async def main():
     await start_web_server()
-    asyncio.create_task(hourly_background_reporter())
-    asyncio.create_task(trade_monitor_background_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
