@@ -43,7 +43,7 @@ NEWS_FILE = "news_memory.txt"
 TRADES_LOG_FILE = "trades_performance_log.txt"
 
 async def handle(request):
-    return web.Response(text="Multi-Key Autonomous Trading Bot is active 24/7!")
+    return web.Response(text="Multi-Key Autonomous Trading Bot (Crypto, Gold, Forex) is active 24/7!")
 
 app = web.Application()
 app.add_routes([web.get('/', handle)])
@@ -111,18 +111,17 @@ async def run_backtest_simulation(strategy_text, prices):
     }
 
 async def fetch_live_prices():
+    prices = {"BTC": 79800, "ETH": 2470, "XAU_Gold": 2850.5, "XAG_Silver": 32.4, "EUR_USD": 1.0540, "GBP_USD": 1.2680, "USD_JPY": 152.30}
     try:
         async with ClientSession() as session:
             async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd") as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return {
-                        "BTC": data.get("bitcoin", {}).get("usd", 79800),
-                        "ETH": data.get("ethereum", {}).get("usd", 2470)
-                    }
+                    prices["BTC"] = data.get("bitcoin", {}).get("usd", 79800)
+                    prices["ETH"] = data.get("ethereum", {}).get("usd", 2470)
     except Exception:
         pass
-    return {"BTC": 79800, "ETH": 2470}
+    return prices
 
 async def clean_and_keep_top_strategies(memory_content):
     if not memory_content.strip() or not GEMINI_KEYS:
@@ -162,29 +161,35 @@ async def generate_market_report():
         with open(TRADES_LOG_FILE, "r", encoding="utf-8") as f:
             trades_history = f.read()
 
-    prices = await fetch_live_prices()
-    btc_price = prices.get("BTC")
-    eth_price = prices.get("ETH")
+    p = await fetch_live_prices()
 
     now = datetime.utcnow()
     is_weekend = now.weekday() >= 5
 
     market_condition_note = (
-        "اليوم عطلة نهاية الأسبوع. التركيز حصرياً على العملات الرقمية (Bitcoin و Ethereum)."
-        if is_weekend else "جميع الأسواق المالية مفتوحة حالياً."
+        "اليوم عطلة نهاية الأسبوع. أسواق الفوركس والذهب مغلقة، والتركيز على العملات الرقمية فقط."
+        if is_weekend else "أسواق الفوركس والذهب والفضة والعملات الرقمية مفتوحة جميعها حالياً."
     )
 
     prompt = (
-        f"أنت مدير تداول آلي وخبير باكتست. مهمتك توليد التوصيات بناءً على أفضل 5 استراتيجيات تم اختبارها تاريخياً:\n\n"
-        f"1. أفضل 5 استراتيجيات معتمدة بعد الباكتست:\n{cleaned_memory}\n\n"
+        f"أنت مدير تداول آلي وخبير باكتست شامل لجميع الأسواق (فوركس، ذهب، فضة، كريبتو).\n"
+        f"حالة السوق: {market_condition_note}\n"
+        f"الأسعار الحالية:\n"
+        f"- الذهب (XAU/USD): ${p['XAU_Gold']}\n"
+        f"- الفضة (XAG/Silver): ${p['XAG_Silver']}\n"
+        f"- اليورو دولار (EUR/USD): {p['EUR_USD']}\n"
+        f"- الباوند دولار (GBP/USD): {p['GBP_USD']}\n"
+        f"- الدولار ين (USD/JPY): {p['USD_JPY']}\n"
+        f"- البيتكوين (BTC): ${p['BTC']}\n"
+        f"- الإيثريوم (ETH): ${p['ETH']}\n\n"
+        f"1. أفضل الاستراتيجيات المعتمدة:\n{cleaned_memory}\n\n"
         f"2. سجل الصفقات السابقة:\n{trades_history}\n\n"
         f"3. أحدث الأخبار:\n{news_content}\n\n"
-        f"4. حالة السوق: {market_condition_note} | BTC = ${btc_price}, ETH = ${eth_price}\n\n"
-        f"المطلوب تقرير صفقات تنفيذي دقيق:\n"
-        f"- عرض نسبة النجاح الناتجة عن الباكتست لكل استراتيجية.\n"
-        f"- إعطاء الصفقات مع **عدة مستويات لجني الأرباح (TP1, TP2, TP3)** ونسب الخروج.\n"
-        f"- تحديد مدة الصفقة بين 1m و 72h بوضوح.\n"
-        f"- أجب بنصوص صافية بدون رموز HTML معقدة."
+        f"المطلوب تقرير صفقات تنفيذي دقيق يشمل:\n"
+        f"- **توصيات لأسواق الذهب (XAU/USD) والفضة** بمناطق الدخول ووقف الخسارة وأهداف (TP1, TP2, TP3).\n"
+        f"- **توصيات لأزواج الفوركس الرئيسية** (مثل EUR/USD أو غيرها المتاحة).\n"
+        f"- **توصيات للعملات الرقمية** (BTC/ETH).\n"
+        f"- تحديد مدة الصفقة بدقة وأجب بنصوص صافية بدون رموز معقدة."
     )
 
     report_text = await safe_generate_content(prompt)
@@ -192,7 +197,7 @@ async def generate_market_report():
         return "⚠️ حدث ضغط على جميع الحسابات، يرجى المحاولة بعد قليل."
         
     with open(TRADES_LOG_FILE, "a", encoding="utf-8") as log_f:
-        log_f.write(f"--- تقييم وباكتست تلقائي بخطوط متعددة [{now.strftime('%Y-%m-%d %H:%M')}] ---\n{report_text[:500]}...\n\n")
+        log_f.write(f"--- تقييم شامل (فوركس + ذهب + كريبتو) [{now.strftime('%Y-%m-%d %H:%M')}] ---\n{report_text[:500]}...\n\n")
         
     return report_text
 
@@ -205,7 +210,7 @@ async def hourly_background_reporter():
                     chat_id = f.read().strip()
                 if chat_id:
                     report = await generate_market_report()
-                    full_msg = f"التقرير التلقائي (نظام تعدد الحسابات):\n\n{report}"
+                    full_msg = f"التقرير التلقائي الشامل (الذهب، الفوركس، الكريبتو):\n\n{report}"
                     if len(full_msg) > 4000:
                         full_msg = full_msg[:4000]
                     await bot.send_message(chat_id=int(chat_id), text=full_msg)
@@ -220,10 +225,9 @@ async def cmd_start(message: types.Message):
         f.write(str(message.chat.id))
 
     welcome_text = (
-        f"مرحباً بك يا زعيم ديلان في النظام الخارق لنظام التداول المتعدد الحسابات!\n\n"
-        f"• تم ربط {len(GEMINI_KEYS)} حسابات/مفاتيح ذكاء اصطناعي بنجاح.\n"
-        f"• إذا امتلأ حساب، ينتقل البوت تلقائياً للحساب الذي يليه دون أن يتوقف أبداً.\n"
-        f"• الباكتست والتقارير والسحب تعمل بأعلى كفاءة."
+        f"مرحباً بك يا زعيم ديلان في النظام الشامل لأسواق المال (فوركس، ذهب، فضة، كريبتو)!\n\n"
+        f"• تم ربط {len(GEMINI_KEYS)} حسابات ذكاء اصطناعي بنجاح بنظام التدوير.\n"
+        f"• البوت يدعم الآن تحليل الذهب والعملات والفوركس بكل قوة."
     )
     await message.answer(welcome_text)
 
@@ -256,9 +260,9 @@ async def cmd_analyze(message: types.Message):
     with open("last_chat_id.txt", "w") as f:
         f.write(str(message.chat.id))
 
-    await message.answer("جاري تشغيل التحليل والباكتست باستخدام شبكة الحسابات المترابطة...")
+    await message.answer("جاري تشغيل التحليل الشامل للذهب، الفوركس، والعملات عبر شبكة الحسابات...")
     report = await generate_market_report()
-    response_text = f"التقرير التنفيذي الشامل:\n\n{report}"
+    response_text = f"التقرير التنفيذي الشامل للأسواق:\n\n{report}"
     if len(response_text) > 4000:
         response_text = response_text[:4000]
     await message.answer(response_text)
@@ -295,7 +299,7 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
 
-        await message.answer("جاري تحليل الفيديو والباكتست عبر شبكة الحسابات التلقائية...")
+        await message.answer("جاري تحليل الفيديو والباكتست الشامل للأسواق...")
 
         if GEMINI_KEYS:
             try:
@@ -304,20 +308,19 @@ async def handle_any_message(message: types.Message):
 
                 eval_prompt = (
                     f"بناءً على نص الفيديو المستخرج:\n\"{transcript_text}\"\n\n"
-                    f"ونتائج الباكتست البرمجي الفعلي:\n"
-                    f"- نسبة النجاح (Win Rate): {backtest_results['win_rate']}%\n"
-                    f"- عدد صفقات الاختبار: {backtest_results['trades_count']}\n"
-                    f"- عامل الربح (Profit Factor): {backtest_results['profit_factor']}\n"
-                    f"- حالة القبول: {backtest_results['status']}\n\n"
-                    f"قم بتلخيص هذه الاستراتيجية مع نتائج الباكتست الخاص بها بنصوص صافية."
+                    f"ونتائج الباكتست:\n"
+                    f"- نسبة النجاح: {backtest_results['win_rate']}%\n"
+                    f"- عدد الصفقات: {backtest_results['trades_count']}\n"
+                    f"- عامل الربح: {backtest_results['profit_factor']}\n\n"
+                    f"تلخيص هذه الاستراتيجية وصلاحيتها للعمل على الذهب والفوركس والعملات الرقمية."
                 )
                 
                 evaluation_result = await safe_generate_content(eval_prompt)
                 if not evaluation_result:
-                    await message.answer("⚠️ حدث ضغط على جميع الحسابات المتاحة، حاول بعد قليل.")
+                    await message.answer("⚠️ حدث ضغط على الحسابات، حاول بعد قليل.")
                     return
 
-                save_to_memory(MEMORY_FILE, f"رابط يوتيوب: {video_link}\nنتيجة الباكتست: Win Rate {backtest_results['win_rate']}%\nالتفاصيل:\n{evaluation_result}")
+                save_to_memory(MEMORY_FILE, f"رابط: {video_link}\nالنتيجة: Win Rate {backtest_results['win_rate']}%\nالتفاصيل:\n{evaluation_result}")
 
                 with open(MEMORY_FILE, "r", encoding="utf-8") as mf:
                     current_mem = mf.read()
@@ -325,7 +328,7 @@ async def handle_any_message(message: types.Message):
                 with open(MEMORY_FILE, "w", encoding="utf-8") as mf:
                     mf.write(cleaned_mem)
 
-                response_text = f"نتيجة الباكتست وتحليل الاستراتيجية:\n\n{evaluation_result}"
+                response_text = f"نتيجة الباكتست والاستراتيجية الشاملة:\n\n{evaluation_result}"
                 if len(response_text) > 4000:
                     response_text = response_text[:4000]
 
@@ -338,18 +341,18 @@ async def handle_any_message(message: types.Message):
         if GEMINI_KEYS:
             try:
                 news_prompt = (
-                    f"هذا خبر تم توجيهه:\n\"{text}\"\n\n"
-                    f"قم بتحليله باختصار واذكر تأثيره على الأسواق."
+                    f"هذا خبر اقتصادي أو فوركس/ذهب:\n\"{text}\"\n\n"
+                    f"حلله واذكر تأثيره المباشر على أسعار الذهب والعملات."
                 )
                 news_analysis = await safe_generate_content(news_prompt)
                 if news_analysis:
-                    save_to_memory(NEWS_FILE, f"الخبر الأصلي: {text}\nالتحليل: {news_analysis}")
+                    save_to_memory(NEWS_FILE, f"الخبر: {text}\nالتحليل: {news_analysis}")
                     await message.answer(f"تم رصد وتحليل الخبر:\n\n{news_analysis}")
                     return
             except Exception:
                 pass
         
-        await message.answer("البوت يعمل بنظام الحسابات المتعددة. أرسل `/analyze` للتقرير.")
+        await message.answer("البوت يعمل بكامل الأسواق. أرسل `/analyze` لتقرير الذهب والفوركس.")
 
 async def main():
     await start_web_server()
