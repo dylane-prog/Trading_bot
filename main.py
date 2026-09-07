@@ -2,7 +2,7 @@ import os
 import subprocess
 import sys
 
-required_packages = ["aiogram", "aiohttp", "google-genai", "yfinance"]
+required_packages = ["aiogram", "aiohttp", "google-genai"]
 for package in required_packages:
     try:
         __import__(package if package != "google-genai" else "google.genai")
@@ -16,7 +16,6 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 import google.genai as genai
-import yfinance as yf
 
 TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEYS_RAW = os.getenv("GEMINI_API_KEYS", "")
@@ -45,11 +44,56 @@ key_manager = KeyManager(GEMINI_KEYS)
 MEMORY_FILE = "strategies_memory.txt"
 NEWS_FILE = "news_memory.txt"
 
+# --- استقبال تنبيهات TradingView الحية من أي سوق ---
+async def tradingview_webhook(request):
+    try:
+        data = await request.json()
+        # المتوقع إرساله من تداول فيو: asset, price, action
+        asset = data.get("asset", "المنصة")
+        price = data.get("price", "0.0")
+        action = data.get("action", "تحليل")
+        
+        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        
+        # قراءة الذاكرة لتحليل الذكاء الاصطناعي
+        memory_content = ""
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                memory_content = f.read()[-1000:]
+
+        prompt = f"السعر الحالي المباشر من TradingView للأصل {asset} هو {price}. أعطني تحليلاً موجزاً للوضع بناءً على استراتيجياتنا:\n{memory_content}"
+        ai_analysis = await safe_generate_content(prompt)
+        if not ai_analysis:
+            ai_analysis = "حركة الأسعار عند مستويات حاسمة."
+
+        report = (
+            f"🚨 **تنبيه حقيقي من السوق (TradingView)**\n"
+            f"📊 **الأصل:** {asset}\n"
+            f"⏱️ الوقت: {current_time_str}\n\n"
+            f"• **السعر الفوري:** `{price}`\n"
+            f"• **الحركة/الإشارة:** `{action}`\n\n"
+            f"📝 **رؤية تحليلية:**\n{ai_analysis[:800]}"
+        )
+
+        # إرسال التقرير لآخر مستخدم تفاعل مع البوت
+        if os.path.exists("last_chat_id.txt"):
+            with open("last_chat_id.txt", "r") as f:
+                chat_id = f.read().strip()
+            if chat_id:
+                await bot.send_message(chat_id, report)
+
+        return web.Response(text="Webhook Received Successfully", status=200)
+    except Exception as e:
+        return web.Response(text=f"Error: {str(e)}", status=400)
+
 async def handle(request):
-    return web.Response(text="Forex & Crypto Sync Bot is Running!")
+    return web.Response(text="TradingView & Telegram Sync Bot is Running!")
 
 app = web.Application()
-app.add_routes([web.get('/', handle)])
+app.add_routes([
+    web.get('/', handle),
+    web.post('/webhook', tradingview_webhook) # مسار استقبال بيانات السوق اللحظية
+])
 
 async def start_web_server():
     runner = web.AppRunner(app)
@@ -71,123 +115,15 @@ async def safe_generate_content(prompt, model='gemini-2.5-flash', retries=3):
             await asyncio.sleep(1)
     return None
 
-def fetch_live_market_price(ticker_symbol, default_price):
-    """جلب السعر الفوري الحي لضمان مطابقة السوق تماماً"""
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-        # جلب آخر بيانات دقيقة متاحة من السوق
-        df = ticker.history(period='1d', interval='1m')
-        if df.empty:
-            df = ticker.history(period='1d')
-        if not df.empty:
-            val = float(df['Close'].iloc[-1])
-            return round(val, 4) if val < 10 else round(val, 2)
-    except Exception:
-        pass
-    return default_price
-
-async def generate_single_asset_report(asset_name, ticker_symbol, default_price, sl_val, tp1_val, tp2_val):
-    if not GEMINI_KEYS: return "⚠️ مفاتيح الذكاء الاصطناعي غير مضبوطة."
-    
-    # السعر اللحظي المتزامن مع السوق
-    current_price = fetch_live_market_price(ticker_symbol, default_price)
-    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
-    memory_content = ""
-    if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            memory_content = f.read()[-1000:]
-
-    prompt = f"بناءً على السعر الحالي المباشر {current_price} للأصل {asset_name}، أعطني تحليلاً فنياً موجزاً يحدد الاتجاه وأسباب الزخم بناءً على استراتيجياتنا:\n{memory_content}"
-    ai_analysis = await safe_generate_content(prompt)
-    if not ai_analysis:
-        ai_analysis = "حركة الأسعار تحترم مستويات الدعم والمقاومة الحالية."
-
-    report = (
-        f"📊 **تحليل السوق اللحظي: {asset_name}**\n"
-        f"⏱️ الوقت: {current_time_str}\n\n"
-        f"• **السعر الحي الآن:** `{current_price}`\n"
-        f"• **منطقة الدخول:** `{round(current_price - 0.5, 2)} - {current_price}`\n"
-        f"• **الاتجاه:** شراء (BUY)\n"
-        f"• **وقف الخسارة (SL):** `{round(current_price - sl_val, 2)}`\n"
-        f"• **الأهداف (TP):**\n"
-        f"  - الهدف الأول: `{round(current_price + tp1_val, 2)}`\n"
-        f"  - الهدف الثاني: `{round(current_price + tp2_val, 2)}`\n\n"
-        f"📝 **رؤية تحليلية:**\n{ai_analysis[:800]}"
-    )
-    return report
-
-async def market_sync_loop():
-    await asyncio.sleep(15)
-    while True:
-        try:
-            if os.path.exists("last_chat_id.txt"):
-                with open("last_chat_id.txt", "r") as f:
-                    chat_id = f.read().strip()
-                if chat_id:
-                    report = await generate_single_asset_report("الذهب (XAU/USD)", "GC=F", 4406.0, 5.0, 4.0, 8.0)
-                    await bot.send_message(chat_id, f"🔄 **تحديث السوق التلقائي:**\n\n{report}")
-        except Exception as e:
-            print(f"Sync Error: {e}")
-        await asyncio.sleep(3600) # تحديث تلقائي كل ساعة
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
     await message.answer(
-        "أهلاً بك يا زعيم! البوت متزامن الآن مع حركة الأسواق الحية:\n\n"
-        "🟡 **المعادن:**\n• `/analyzeGold` - الذهب\n• `/analyzeSilver` - الفضة\n\n"
-        "💱 **الفوركس:**\n• `/analyzeEurUsd` - يورو / دولار\n• `/analyzeGbpUsd` - باوند / دولار\n• `/analyzeUsdJpy` - دولار / ين\n\n"
-        "🪙 **الكريبتو:**\n• `/analyzeBtc` - بيتكوين\n• `/analyzeEth` - إيثريوم\n• `/analyzeSol` - سولانا"
+        "أهلاً بك يا زعيم! البوت جاهز الآن لاستقبال بيانات السوق الحية مباشرة عبر **TradingView Webhooks**.\n\n"
+        "• قم بإرسال أي استراتيجية أو رابط وسيقوم البوت بحفظها.\n"
+        "• استخدم أمر `/strategies` أو `/news` للمراجعة.\n"
+        "• أي تنبيه تضبطه على TradingView برابط الـ Webhook الخاص بك سيصلك تحليله فوراً هنا!"
     )
-
-@dp.message(Command("analyzeGold"))
-async def cmd_gold(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري جلب السعر الحي للذهب...")
-    await message.answer(await generate_single_asset_report("الذهب (XAU/USD)", "GC=F", 4406.0, 5.0, 4.0, 8.0))
-
-@dp.message(Command("analyzeSilver"))
-async def cmd_silver(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري جلب السعر الحي للفضة...")
-    await message.answer(await generate_single_asset_report("الفضة (XAG/USD)", "SI=F", 32.40, 0.25, 0.30, 0.60))
-
-@dp.message(Command("analyzeEurUsd"))
-async def cmd_eurusd(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري جلب السعر الحي لـ EUR/USD...")
-    await message.answer(await generate_single_asset_report("يورو/دولار (EUR/USD)", "EURUSD=X", 1.0500, 0.0030, 0.0025, 0.0050))
-
-@dp.message(Command("analyzeGbpUsd"))
-async def cmd_gbpusd(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري جلب السعر الحي لـ GBP/USD...")
-    await message.answer(await generate_single_asset_report("باوند/دولار (GBP/USD)", "GBPUSD=X", 1.2650, 0.0035, 0.0030, 0.0060))
-
-@dp.message(Command("analyzeUsdJpy"))
-async def cmd_usdjpy(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري جلب السعر الحي لـ USD/JPY...")
-    await message.answer(await generate_single_asset_report("دولار/ين (USD/JPY)", "USDJPY=X", 153.00, 0.40, 0.35, 0.70))
-
-@dp.message(Command("analyzeBtc"))
-async def cmd_btc(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري جلب السعر الحي للبيتكوين...")
-    await message.answer(await generate_single_asset_report("البيتكوين (BTC/USD)", "BTC-USD", 85000.0, 500.0, 800.0, 1500.0))
-
-@dp.message(Command("analyzeEth"))
-async def cmd_eth(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري جلب السعر الحي للإيثريوم...")
-    await message.answer(await generate_single_asset_report("الإيثريوم (ETH/USD)", "ETH-USD", 3100.0, 50.0, 80.0, 150.0))
-
-@dp.message(Command("analyzeSol"))
-async def cmd_sol(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري جلب السعر الحي لسولانا...")
-    await message.answer(await generate_single_asset_report("سولانا (SOL/USD)", "SOL-USD", 180.0, 4.0, 6.0, 12.0))
 
 @dp.message(Command("strategies"))
 async def cmd_strategies(message: types.Message):
@@ -235,7 +171,6 @@ async def handle_any_message(message: types.Message):
 
 async def main():
     await start_web_server()
-    asyncio.create_task(market_sync_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
