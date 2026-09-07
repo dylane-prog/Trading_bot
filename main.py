@@ -71,16 +71,17 @@ async def safe_generate_content(prompt, model='gemini-2.5-flash', retries=3):
             await asyncio.sleep(1)
     return None
 
-def fetch_specific_asset_price(ticker_symbol, default_price):
+def fetch_live_market_price(ticker_symbol, default_price):
+    """جلب السعر الفوري الحي لضمان مطابقة السوق تماماً"""
     try:
         ticker = yf.Ticker(ticker_symbol)
-        todays_data = ticker.history(period='1d', interval='1m')
-        if not todays_data.empty:
-            val = float(todays_data['Close'].iloc[-1])
-            if val < 10:
-                return round(val, 4)
-            else:
-                return round(val, 2)
+        # جلب آخر بيانات دقيقة متاحة من السوق
+        df = ticker.history(period='1d', interval='1m')
+        if df.empty:
+            df = ticker.history(period='1d')
+        if not df.empty:
+            val = float(df['Close'].iloc[-1])
+            return round(val, 4) if val < 10 else round(val, 2)
     except Exception:
         pass
     return default_price
@@ -88,7 +89,8 @@ def fetch_specific_asset_price(ticker_symbol, default_price):
 async def generate_single_asset_report(asset_name, ticker_symbol, default_price, sl_val, tp1_val, tp2_val):
     if not GEMINI_KEYS: return "⚠️ مفاتيح الذكاء الاصطناعي غير مضبوطة."
     
-    current_price = fetch_specific_asset_price(ticker_symbol, default_price)
+    # السعر اللحظي المتزامن مع السوق
+    current_price = fetch_live_market_price(ticker_symbol, default_price)
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     
     memory_content = ""
@@ -96,48 +98,54 @@ async def generate_single_asset_report(asset_name, ticker_symbol, default_price,
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             memory_content = f.read()[-1000:]
 
-    prompt = f"بناءً على السعر الحالي {current_price} للأصل {asset_name}، أعطني تحليلاً فنياً موجزاً يحدد الاتجاه (شراء/بيع) وأسباب الزخم:\n{memory_content}"
+    prompt = f"بناءً على السعر الحالي المباشر {current_price} للأصل {asset_name}، أعطني تحليلاً فنياً موجزاً يحدد الاتجاه وأسباب الزخم بناءً على استراتيجياتنا:\n{memory_content}"
     ai_analysis = await safe_generate_content(prompt)
     if not ai_analysis:
         ai_analysis = "حركة الأسعار تحترم مستويات الدعم والمقاومة الحالية."
 
     report = (
-        f"📊 **تحليل خاص: {asset_name}**\n"
+        f"📊 **تحليل السوق اللحظي: {asset_name}**\n"
         f"⏱️ الوقت: {current_time_str}\n\n"
         f"• **السعر الحي الآن:** `{current_price}`\n"
-        f"• **منطقة الدخول:** `{round(current_price - (sl_val * 0.1), 4) if current_price < 10 else round(current_price - 0.5, 2)} - {current_price}`\n"
+        f"• **منطقة الدخول:** `{round(current_price - 0.5, 2)} - {current_price}`\n"
         f"• **الاتجاه:** شراء (BUY)\n"
-        f"• **وقف الخسارة (SL):** `{round(current_price - sl_val, 4 if current_price < 10 else 2)}`\n"
+        f"• **وقف الخسارة (SL):** `{round(current_price - sl_val, 2)}`\n"
         f"• **الأهداف (TP):**\n"
-        f"  - الهدف الأول: `{round(current_price + tp1_val, 4 if current_price < 10 else 2)}`\n"
-        f"  - الهدف الثاني: `{round(current_price + tp2_val, 4 if current_price < 10 else 2)}`\n\n"
+        f"  - الهدف الأول: `{round(current_price + tp1_val, 2)}`\n"
+        f"  - الهدف الثاني: `{round(current_price + tp2_val, 2)}`\n\n"
         f"📝 **رؤية تحليلية:**\n{ai_analysis[:800]}"
     )
     return report
+
+async def market_sync_loop():
+    await asyncio.sleep(15)
+    while True:
+        try:
+            if os.path.exists("last_chat_id.txt"):
+                with open("last_chat_id.txt", "r") as f:
+                    chat_id = f.read().strip()
+                if chat_id:
+                    report = await generate_single_asset_report("الذهب (XAU/USD)", "GC=F", 4406.0, 5.0, 4.0, 8.0)
+                    await bot.send_message(chat_id, f"🔄 **تحديث السوق التلقائي:**\n\n{report}")
+        except Exception as e:
+            print(f"Sync Error: {e}")
+        await asyncio.sleep(3600) # تحديث تلقائي كل ساعة
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
     await message.answer(
-        "أهلاً بك يا زعيم! البوت جاهز بكل أقسام السوق (معادن، فوركس، كريبتو):\n\n"
-        "🟡 **المعادن:**\n"
-        "• `/analyzeGold` - الذهب\n"
-        "• `/analyzeSilver` - الفضة\n\n"
-        "💱 **الفوركس:**\n"
-        "• `/analyzeEurUsd` - يورو / دولار\n"
-        "• `/analyzeGbpUsd` - باوند / دولار\n"
-        "• `/analyzeUsdJpy` - دولار / ين\n\n"
-        "🪙 **الكريبتو:**\n"
-        "• `/analyzeBtc` - بيتكوين\n"
-        "• `/analyzeEth` - إيثريوم\n"
-        "• `/analyzeSol` - سولانا"
+        "أهلاً بك يا زعيم! البوت متزامن الآن مع حركة الأسواق الحية:\n\n"
+        "🟡 **المعادن:**\n• `/analyzeGold` - الذهب\n• `/analyzeSilver` - الفضة\n\n"
+        "💱 **الفوركس:**\n• `/analyzeEurUsd` - يورو / دولار\n• `/analyzeGbpUsd` - باوند / دولار\n• `/analyzeUsdJpy` - دولار / ين\n\n"
+        "🪙 **الكريبتو:**\n• `/analyzeBtc` - بيتكوين\n• `/analyzeEth` - إيثريوم\n• `/analyzeSol` - سولانا"
     )
 
 @dp.message(Command("analyzeGold"))
 async def cmd_gold(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
     await message.answer("🔄 جاري جلب السعر الحي للذهب...")
-    await message.answer(await generate_single_asset_report("الذهب (XAU/USD)", "GC=F", 4412.0, 5.0, 4.0, 8.0))
+    await message.answer(await generate_single_asset_report("الذهب (XAU/USD)", "GC=F", 4406.0, 5.0, 4.0, 8.0))
 
 @dp.message(Command("analyzeSilver"))
 async def cmd_silver(message: types.Message):
@@ -184,10 +192,6 @@ async def cmd_sol(message: types.Message):
 @dp.message(Command("strategies"))
 async def cmd_strategies(message: types.Message):
     if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r", encoding="text") as f: # تم التصحيح
-            pass
-    # جلب الاستراتيجيات بشكل مبسط وآمن
-    if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             content = f.read()
         if content.strip():
@@ -205,7 +209,6 @@ async def cmd_news(message: types.Message):
             return
     await message.answer("لا توجد أخبار مسجلة.")
 
-# الفلتر الحصري المانع للأوامر: يتأكد تماماً أن النص ليس أمراً قبل استقباله
 @dp.message(F.text.func(lambda text: not text.startswith("/")))
 async def handle_any_message(message: types.Message):
     text = message.text or message.caption
@@ -232,6 +235,7 @@ async def handle_any_message(message: types.Message):
 
 async def main():
     await start_web_server()
+    asyncio.create_task(market_sync_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
