@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime
 from aiohttp import web, ClientSession
 from aiogram import Bot, Dispatcher, types
@@ -35,8 +36,11 @@ key_manager = KeyManager(GEMINI_KEYS)
 MEMORY_FILE = "strategies_memory.txt"
 NEWS_FILE = "news_memory.txt"
 
+# تخزين نشط لآخر الصفقات التي تم إرسالها لمراقبتها
+active_trades_cache = []
+
 async def handle(request):
-    return web.Response(text="Trading Bot with Precise Durations is Running!")
+    return web.Response(text="Trading Bot with Trade Monitoring is Running!")
 
 app = web.Application()
 app.add_routes([web.get('/', handle)])
@@ -97,6 +101,7 @@ async def fetch_live_prices():
     return prices
 
 async def generate_market_report():
+    global active_trades_cache
     if not GEMINI_KEYS: return "⚠️ مفاتيح الذكاء الاصطناعي غير مضبوطة."
     
     memory_content = "لا توجد استراتيجيات مسجلة."
@@ -112,29 +117,75 @@ async def generate_market_report():
     p = await fetch_live_prices()
     current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    # برومبت يفرض تحديد مدة الصفقة بدقة لكل أصل
     prompt = (
         f"أنت خبير تداول آلي تنفيذي صارم. وقت إصدار التقرير الحالي هو: {current_time_str}.\n"
-        f"ممنوع الثرثرة أو الكلام الإنشائي. قدم تقريراً مباشراً ومنظماً يغطي جميع الأسواق (الذهب، الفضة، الفوركس، والعملات الرقمية).\n\n"
+        f"قدم تقريراً مباشراً ومنظماً يغطي جميع الأسواق (الذهب، الفضة، الفوركس، والعملات الرقمية).\n\n"
         f"الأسعار الحية الحالية:\n"
         f"- الذهب (XAU/USD): ${p['XAU_Gold']}\n"
         f"- الفضة (XAG/USD): ${p['XAG_Silver']}\n"
-        f"- اليورو دولار (EUR/USD): {p['EUR_USD']}\n"
-        f"- الباوند دولار (GBP/USD): {p['GBP_USD']}\n"
+        f"- اليورو دولار (EUR_USD): {p['EUR_USD']}\n"
+        f"- الباوند دولار (GBP_USD): {p['GBP_USD']}\n"
         f"- البيتكوين (BTC): ${p['BTC']}\n"
         f"- الإيثريوم (ETH): ${p['ETH']}\n\n"
         f"الاستراتيجيات والأخبار المتاحة:\n{memory_content}\n{news_content}\n\n"
         f"المطلوب لكل أصل تداول في التقرير، اذكر بدقة:\n"
-        f"1. الاتجاه (شراء/بيع)\n"
+        f"1. اسم الأصل والاتجاه (شراء/بيع)\n"
         f"2. منطقة الدخول\n"
         f"3. وقف الخسارة (SL)\n"
         f"4. الأهداف (TP1, TP2, TP3)\n"
-        f"5. **مدة الصفقة المتوقعة بدقة (مثال: صفقة سكالبينج من 2 إلى 6 ساعات / صفقة انترداي من 12 إلى 24 ساعة / صفقة سوينغ من يومين إلى 4 أيام)**\n"
-        f"نظم التقرير بشكل احترافي وخالٍ من الحشو."
+        f"5. **المدة الزمنية الصغرى المتوقعة للصفقة بالدقائق أو الساعات (مثال صريح: 120 دقيقة أو 2 ساعة أو 24 ساعة)**\n"
+        f"نظم التقرير بشكل احترافي."
     )
 
     report_text = await safe_generate_content(prompt)
+    if report_text:
+        active_trades_cache = [report_text, current_time_str]
     return report_text if report_text else "⚠️ حدث ضغط، حاول لاحقاً."
+
+# نظام مراقبة الصفقات كل 10% من الوقت الأصغر
+async def trade_monitor_background_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            if active_trades_cache and os.path.exists("last_chat_id.txt"):
+                with open("last_chat_id.txt", "r") as f:
+                    chat_id = f.read().strip()
+                if chat_id:
+                    report_text = active_trades_cache[0]
+                    # استخراج أقصر مدة زمنية بالدقائق تم ذكرها في التقرير
+                    found_numbers = re.findall(r'(\d+)\s*(دقيقة|دقائق|ساعة|ساعات|يوم|أيام)', report_text)
+                    min_minutes = 60 # افتراضي ساعة في حال عدم التحديد بدقة
+                    
+                    if found_numbers:
+                        val = int(found_numbers[0][0])
+                        unit = found_numbers[0][1]
+                        if "ساعة" in unit or "ساعات" in unit:
+                            min_minutes = val * 60
+                        elif "يوم" in unit or "أيام" in unit:
+                            min_minutes = val * 24 * 60
+                        else:
+                            min_minutes = val
+
+                    # حساب 10% من الوقت الأصغر
+                    check_interval = max(int((min_minutes * 60) * 0.1), 30) # الحد الأدنى للمراقبة 30 ثانية منعاً للضغط
+                    
+                    await asyncio.sleep(check_interval)
+                    
+                    # تحليل حالة الصفقات الحالية ورصد الانعكاس
+                    p = await fetch_live_prices()
+                    monitor_prompt = (
+                        f"بناءً على الصفقات السابقة والأسعار الحية الحالية:\n{report_text}\n\n"
+                        f"الأسعار الآن:\nالذهب: {p['XAU_Gold']} | الفضة: {p['XAG_Silver']} | اليورو: {p['EUR_USD']} | البيتكوين: {p['BTC']}\n\n"
+                        f"قم بتحليل سريع وصارم: هل توجد أي إشارة انعكاس محتملة أو خطر على إحدى الصفقات؟ "
+                        f"إذا كانت الصفقة تسير بشكل جيد، اعطِ تنبيهاً قصيراً للاستمرار. وإذا ظهر خطر انعكاس، نبه المستخدم فوراً بضرورة الإغلاق أو تعديل وقف الخسارة."
+                    )
+                    analysis = await safe_generate_content(monitor_prompt)
+                    if analysis:
+                        await bot.send_message(chat_id=int(chat_id), text=f"⚠️ **تحديث ومراقبة دورية (كل 10% من الوقت):**\n\n{analysis[:3500]}")
+                        continue
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
 async def hourly_background_reporter():
     await asyncio.sleep(30)
@@ -153,7 +204,7 @@ async def hourly_background_reporter():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("أهلاً بك يا زعيم! تم تحديث البوت لإضافة مدة كل صفقة بدقة زمنية صحيحة لكل الأسواق.")
+    await message.answer("أهلاً بك يا زعيم! تم تفعيل نظام المراقبة الذكية للصفقات (فحص كل 10% من الوقت الأصغر للتحذير من أي انعكاس).")
 
 @dp.message(Command("strategies"))
 async def cmd_strategies(message: types.Message):
@@ -178,7 +229,7 @@ async def cmd_news(message: types.Message):
 @dp.message(Command("analyze"))
 async def cmd_analyze(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري إعداد التقرير التنفيذي مع تحديد أوقات ومدد الصفقات بدقة...")
+    await message.answer("🔄 جاري إعداد التقرير وبدء مؤقت المراقبة الذكية للصفقات...")
     report = await generate_market_report()
     await message.answer(f"📊 التقرير المباشر:\n\n{report[:4000]}")
 
@@ -208,6 +259,7 @@ async def handle_any_message(message: types.Message):
 async def main():
     await start_web_server()
     asyncio.create_task(hourly_background_reporter())
+    asyncio.create_task(trade_monitor_background_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
