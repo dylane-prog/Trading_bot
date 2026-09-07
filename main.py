@@ -36,7 +36,7 @@ MEMORY_FILE = "strategies_memory.txt"
 NEWS_FILE = "news_memory.txt"
 
 async def handle(request):
-    return web.Response(text="Clean & Direct Multi-Market Trading Bot is Running!")
+    return web.Response(text="Trading Bot with Precise Durations is Running!")
 
 app = web.Application()
 app.add_routes([web.get('/', handle)])
@@ -62,7 +62,6 @@ async def safe_generate_content(prompt, model='gemini-3.6-flash', retries=3):
     return None
 
 async def fetch_live_prices():
-    """جلب أسعار حية ومحدثة بدقة لكل الأسواق"""
     prices = {
         "BTC": 85000.0, 
         "ETH": 3100.0, 
@@ -73,7 +72,6 @@ async def fetch_live_prices():
         "USD_JPY": 153.00
     }
     
-    # جلب أسعار العملات الرقمية الحية
     try:
         async with ClientSession() as session:
             async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd") as resp:
@@ -84,7 +82,6 @@ async def fetch_live_prices():
     except Exception:
         pass
 
-    # جلب أسعار الفوركس الحية
     try:
         async with ClientSession() as session:
             async with session.get("https://open.er-api.com/v6/latest/USD") as resp:
@@ -113,10 +110,12 @@ async def generate_market_report():
             news_content = f.read()
 
     p = await fetch_live_prices()
+    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    # برومبت صارم جداً يمنع الثرثرة ويجبر البوت على توزيع الصفقات بالتساوي وبدقة شديدة
+    # برومبت يفرض تحديد مدة الصفقة بدقة لكل أصل
     prompt = (
-        f"أنت خبير تداول آلي تنفيذي صارم. ممنوع منعاً باتاً الإطالة أو الكلام الإنشائي الزائد. قدم تقريراً مباشراً ومنظماً بدقة.\n\n"
+        f"أنت خبير تداول آلي تنفيذي صارم. وقت إصدار التقرير الحالي هو: {current_time_str}.\n"
+        f"ممنوع الثرثرة أو الكلام الإنشائي. قدم تقريراً مباشراً ومنظماً يغطي جميع الأسواق (الذهب، الفضة، الفوركس، والعملات الرقمية).\n\n"
         f"الأسعار الحية الحالية:\n"
         f"- الذهب (XAU/USD): ${p['XAU_Gold']}\n"
         f"- الفضة (XAG/USD): ${p['XAG_Silver']}\n"
@@ -125,13 +124,13 @@ async def generate_market_report():
         f"- البيتكوين (BTC): ${p['BTC']}\n"
         f"- الإيثريوم (ETH): ${p['ETH']}\n\n"
         f"الاستراتيجيات والأخبار المتاحة:\n{memory_content}\n{news_content}\n\n"
-        f"المطلوب: تقديم صفقات واضحة، مختصرة، وصارمة تشمل جميع هذه الأسواق بالتساوي (الذهب، الفضة، الفوركس، والعملات الرقمية).\n"
-        f"لكل أصل، اذكر بالتحديد وسطر بـ سطر:\n"
+        f"المطلوب لكل أصل تداول في التقرير، اذكر بدقة:\n"
         f"1. الاتجاه (شراء/بيع)\n"
         f"2. منطقة الدخول\n"
         f"3. وقف الخسارة (SL)\n"
         f"4. الأهداف (TP1, TP2, TP3)\n"
-        f"اجعل التقرير منسقاً ونظيفاً جداً وخالياً من الحشو."
+        f"5. **مدة الصفقة المتوقعة بدقة (مثال: صفقة سكالبينج من 2 إلى 6 ساعات / صفقة انترداي من 12 إلى 24 ساعة / صفقة سوينغ من يومين إلى 4 أيام)**\n"
+        f"نظم التقرير بشكل احترافي وخالٍ من الحشو."
     )
 
     report_text = await safe_generate_content(prompt)
@@ -154,7 +153,7 @@ async def hourly_background_reporter():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("أهلاً بك يا زعيم! تم ضبط البوت ليقدم صفقات دقيقة، مختصرة، وتشمل جميع الأسواق (ذهب، فضة، فوركس، كريبتو) بدون أي ثرثرة.")
+    await message.answer("أهلاً بك يا زعيم! تم تحديث البوت لإضافة مدة كل صفقة بدقة زمنية صحيحة لكل الأسواق.")
 
 @dp.message(Command("strategies"))
 async def cmd_strategies(message: types.Message):
@@ -179,7 +178,7 @@ async def cmd_news(message: types.Message):
 @dp.message(Command("analyze"))
 async def cmd_analyze(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
-    await message.answer("🔄 جاري إعداد التقرير التنفيذي لجميع الأسواق...")
+    await message.answer("🔄 جاري إعداد التقرير التنفيذي مع تحديد أوقات ومدد الصفقات بدقة...")
     report = await generate_market_report()
     await message.answer(f"📊 التقرير المباشر:\n\n{report[:4000]}")
 
