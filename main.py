@@ -1,6 +1,17 @@
+import os
+import subprocess
+import sys
+
+# تثبيت المكتبات تلقائياً إذا لم تكن موجودة لمنع أي خطأ على Render
+required_packages = ["aiogram", "aiohttp", "google-genai", "yfinance"]
+for package in required_packages:
+    try:
+        __import__(package if package != "google-genai" else "google.genai")
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
 import asyncio
 import logging
-import os
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -68,11 +79,9 @@ def fetch_specific_asset_price(ticker_symbol, default_price):
         todays_data = ticker.history(period='1d', interval='1m')
         if not todays_data.empty:
             val = float(todays_data['Close'].iloc[-1])
-            if val < 10:  # فوركس
+            if val < 10:
                 return round(val, 4)
-            elif val < 1000:  # فضة أو عملات رقمية متوسطة
-                return round(val, 2)
-            else:  # ذهب أو بيتكوين
+            else:
                 return round(val, 2)
     except Exception:
         pass
@@ -108,7 +117,6 @@ async def generate_single_asset_report(asset_name, ticker_symbol, default_price,
     )
     return report
 
-# --- الأوامر المخصصة لكل الأسواق ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
@@ -127,7 +135,6 @@ async def cmd_start(message: types.Message):
         "• `/analyzeSol` - سولانا"
     )
 
-# المعادن
 @dp.message(Command("analyzeGold"))
 async def cmd_gold(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
@@ -140,7 +147,6 @@ async def cmd_silver(message: types.Message):
     await message.answer("🔄 جاري جلب السعر الحي للفضة...")
     await message.answer(await generate_single_asset_report("الفضة (XAG/USD)", "SI=F", 32.40, 0.25, 0.30, 0.60))
 
-# الفوركس
 @dp.message(Command("analyzeEurUsd"))
 async def cmd_eurusd(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
@@ -159,7 +165,6 @@ async def cmd_usdjpy(message: types.Message):
     await message.answer("🔄 جاري جلب السعر الحي لـ USD/JPY...")
     await message.answer(await generate_single_asset_report("دولار/ين (USD/JPY)", "USDJPY=X", 153.00, 0.40, 0.35, 0.70))
 
-# الكريبتو
 @dp.message(Command("analyzeBtc"))
 async def cmd_btc(message: types.Message):
     with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
@@ -216,7 +221,7 @@ async def handle_any_message(message: types.Message):
         await message.answer("📰 جاري تحليل الخبر واحتساب تأثيره على الأسواق...")
         news_analysis = await safe_generate_content(f"لخص تأثير هذا الخبر باختصار شديد:\n\"{text}\"")
         if news_analysis:
-            with open(NEWS_FILE, "=" * 35 if False else "a", encoding="utf-8") as nf:
+            with open(NEWS_FILE, "a", encoding="utf-8") as nf:
                 nf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\nالخبر: {text}\nالتأثير: {news_analysis}\n" + "="*35 + "\n")
             await message.answer(f"✅ تحليل الخبر:\n\n{news_analysis[:3500]}")
             return
