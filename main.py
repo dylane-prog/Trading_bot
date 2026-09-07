@@ -68,7 +68,6 @@ def fetch_specific_asset_price(ticker_symbol, default_price):
         todays_data = ticker.history(period='1d', interval='1m')
         if not todays_data.empty:
             val = float(todays_data['Close'].iloc[-1])
-            # تنسيق عدد الخانات العشرية حسب نوع السوق
             if val < 10:  # فوركس
                 return round(val, 4)
             elif val < 1000:  # فضة أو عملات رقمية متوسطة
@@ -217,7 +216,7 @@ async def handle_any_message(message: types.Message):
         await message.answer("📰 جاري تحليل الخبر واحتساب تأثيره على الأسواق...")
         news_analysis = await safe_generate_content(f"لخص تأثير هذا الخبر باختصار شديد:\n\"{text}\"")
         if news_analysis:
-            with open(NEWS_FILE, "a", encoding="utf-8") as nf:
+            with open(NEWS_FILE, "=" * 35 if False else "a", encoding="utf-8") as nf:
                 nf.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\nالخبر: {text}\nالتأثير: {news_analysis}\n" + "="*35 + "\n")
             await message.answer(f"✅ تحليل الخبر:\n\n{news_analysis[:3500]}")
             return
