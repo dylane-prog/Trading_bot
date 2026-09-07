@@ -2,7 +2,6 @@ import os
 import subprocess
 import sys
 
-# تثبيت المكتبات تلقائياً إذا لم تكن موجودة لمنع أي خطأ على Render
 required_packages = ["aiogram", "aiohttp", "google-genai", "yfinance"]
 for package in required_packages:
     try:
@@ -14,7 +13,7 @@ import asyncio
 import logging
 from datetime import datetime
 from aiohttp import web
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 import google.genai as genai
 import yfinance as yf
@@ -73,7 +72,6 @@ async def safe_generate_content(prompt, model='gemini-2.5-flash', retries=3):
     return None
 
 def fetch_specific_asset_price(ticker_symbol, default_price):
-    """جلب سعر أصل معين (معادن، فوركس، كريبتو) بدقة وحيّة"""
     try:
         ticker = yf.Ticker(ticker_symbol)
         todays_data = ticker.history(period='1d', interval='1m')
@@ -203,11 +201,13 @@ async def cmd_news(message: types.Message):
             return
     await message.answer("لا توجد أخبار مسجلة.")
 
-@dp.message()
+# استخدام الفلتر F.text بحيث يستقبل فقط النصوص العادية التي لا تبدأ بـ / بشكل قاطع
+@dp.message(F.text & ~F.text.startswith("/"))
 async def handle_any_message(message: types.Message):
-    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
     text = message.text or message.caption
     if not text: return
+
+    with open("last_chat_id.txt", "w") as f: f.write(str(message.chat.id))
     
     if "http://" in text or "https://" in text:
         await message.answer("جاري تحليل وحفظ استراتيجية الفيديو...")
