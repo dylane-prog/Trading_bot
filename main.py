@@ -184,6 +184,10 @@ async def cmd_sol(message: types.Message):
 @dp.message(Command("strategies"))
 async def cmd_strategies(message: types.Message):
     if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, "r", encoding="text") as f: # تم التصحيح
+            pass
+    # جلب الاستراتيجيات بشكل مبسط وآمن
+    if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             content = f.read()
         if content.strip():
@@ -201,8 +205,8 @@ async def cmd_news(message: types.Message):
             return
     await message.answer("لا توجد أخبار مسجلة.")
 
-# استخدام الفلتر F.text بحيث يستقبل فقط النصوص العادية التي لا تبدأ بـ / بشكل قاطع
-@dp.message(F.text & ~F.text.startswith("/"))
+# الفلتر الحصري المانع للأوامر: يتأكد تماماً أن النص ليس أمراً قبل استقباله
+@dp.message(F.text.func(lambda text: not text.startswith("/")))
 async def handle_any_message(message: types.Message):
     text = message.text or message.caption
     if not text: return
