@@ -4,6 +4,12 @@ import logging
 import json
 import math
 import uuid
+import re
+import subprocess
+import tempfile
+import shutil
+import sys
+from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
@@ -56,6 +62,18 @@ MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "30"))
 PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "8"))
 MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "trading_state.json")
+STRATEGY_DB_FILE = os.getenv("STRATEGY_DB_FILE", "strategies_db.json")
+TRAINING_TESTS = max(70, int(os.getenv("TRAINING_TESTS", "70")))
+STRATEGY_MIN_TRADES = int(os.getenv("STRATEGY_MIN_TRADES", "10"))
+STRATEGY_TRAINING_LOCK = asyncio.Lock()
+training_status = {
+    "running": False,
+    "strategy_id": "",
+    "strategy_name": "",
+    "tests": 0,
+    "trades": 0,
+    "message": "idle",
+}
 LOCAL_TZ = ZoneInfo("Africa/Algiers")
 
 ASSETS = {
@@ -111,7 +129,7 @@ async def safe_reply(chat_id: int, text: str):
     for chunk in split_text(text):
         try:
             await bot.send_message(chat_id, chunk, parse_mode=None)
-        except (TelegramForbiddenError, Exception) as exc:
+        except Exception as exc:
             logger.warning("Telegram send failed: %s", exc)
             break
 
@@ -706,7 +724,8 @@ async def cmd_start(message: types.Message):
         "👑 مرحبًا بك في Trading Bot\n\n"
         "📈 التحليل الحي:\n/gold\n/btc\n/eurusd\n/silver\n/oil\n/eth\n\n"
         "📌 إدارة الصفقات:\n/trades\n/close ALL\n/close TRADE_ID\n/reanalyze TRADE_ID\n/status\n\n"
-        "🧪 الاختبار:\n/auto_backtest\n/weekly_table\n\n"
+        "🧪 الاختبار والتعلم:\n/auto_backtest\n/weekly_table\n/strategies\n/strategy STRATEGY_ID\n/training\n/retrain STRATEGY_ID\n\n"
+        "🎥 أرسل رابط فيديو للاستراتيجية؛ سيُستخرج النص المتاح ويُختبر تاريخيًا في منطقة التدريب فقط.\n"
         "📰 أرسل أو أعد توجيه خبر إلى البوت لتحليل تأثيره.\n\n"
         "⚠️ لا يوجد ضمان للربح."
     )
@@ -797,6 +816,86 @@ async def cmd_close(message: types.Message):
     await safe_send(message, f"تم إغلاق {closed} صفقة مسجلة.")
 
 # ============================================================
+# LEARNED STRATEGY COMMANDS
+# ============================================================
+@dp.message(Command("strategies"))
+async def cmd_strategies(message: types.Message):
+    rows = top_strategies(10)
+    if not rows:
+        await safe_send(message, "🧠 لا توجد استراتيجيات مدرّبة بعد.\nأرسل رابط فيديو مع كلمة Strategy أو استراتيجية.")
+        return
+
+    lines = ["🏆 أفضل 10 استراتيجيات تم تحليلها وتدريبها", ""]
+    for i, (strategy, result) in enumerate(rows, 1):
+        lines.append(
+            f"{i}. {strategy.name}\n"
+            f"   ID: {strategy.id}\n"
+            f"   Score: {result.score}/100 | PF: {result.profit_factor}\n"
+            f"   Win rate: {result.win_rate}% | Net R: {result.net_r}\n"
+            f"   Trades: {result.trades} | Verdict: {result.verdict}\n"
+        )
+    await safe_send(message, "\n".join(lines))
+
+
+@dp.message(Command("strategy"))
+async def cmd_strategy(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await safe_send(message, "الاستخدام: /strategy STRATEGY_ID")
+        return
+    sid = parts[1].strip().upper()
+    strategy = strategy_from_db(sid)
+    if not strategy:
+        await safe_send(message, "❌ الاستراتيجية غير موجودة.")
+        return
+    await safe_send(message, strategy_display(strategy, result_from_db(sid)))
+
+
+@dp.message(Command("training"))
+async def cmd_training(message: types.Message):
+    if not training_status["running"]:
+        await safe_send(
+            message,
+            f"🧪 حالة التدريب: IDLE\n"
+            f"آخر رسالة: {training_status['message']}\n"
+            f"الاستراتيجيات المحفوظة: {len(strategies_db.get('strategies', {}))}"
+        )
+        return
+    await safe_send(
+        message,
+        "🧪 التدريب يعمل الآن\n"
+        f"Strategy: {training_status['strategy_name']}\n"
+        f"ID: {training_status['strategy_id']}\n"
+        f"Tests completed: {training_status['tests']}\n"
+        f"Trades found: {training_status['trades']}\n"
+        f"Status: {training_status['message']}"
+    )
+
+
+@dp.message(Command("retrain"))
+async def cmd_retrain(message: types.Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await safe_send(message, "الاستخدام: /retrain STRATEGY_ID")
+        return
+    sid = parts[1].strip().upper()
+    strategy = strategy_from_db(sid)
+    if not strategy:
+        await safe_send(message, "❌ الاستراتيجية غير موجودة.")
+        return
+    if training_status["running"]:
+        await safe_send(message, "⚠️ يوجد تدريب آخر يعمل حاليًا. استخدم /training لمتابعته.")
+        return
+    await safe_send(message, f"🔄 إعادة تدريب {strategy.name}...")
+    try:
+        result = await train_strategy(strategy)
+        await safe_send(message, strategy_display(strategy, result))
+    except Exception as exc:
+        logger.exception("Retrain failed")
+        await safe_send(message, f"❌ فشل إعادة التدريب: {str(exc)[:700]}")
+
+
+# ============================================================
 # BACKTEST
 # ============================================================
 def backtest_ema_rsi(candles: List[dict]) -> dict:
@@ -865,6 +964,659 @@ async def cmd_weekly_table(message: types.Message):
     await safe_send(message,text+"\n\nمبني على Backtest فعلي للبيانات المتاحة.")
 
 # ============================================================
+# STRATEGY LEARNING / VIDEO TRAINING ENGINE
+# ============================================================
+@dataclass
+class StrategyDefinition:
+    id: str
+    name: str
+    source_url: str
+    source_text: str
+    description: str
+    indicators: List[str]
+    buy_rules: List[str]
+    sell_rules: List[str]
+    sl_atr: float
+    tp_atr: float
+    max_hold_bars: int
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class StrategyResult:
+    strategy_id: str
+    tests: int
+    trades: int
+    wins: int
+    losses: int
+    neutral: int
+    win_rate: float
+    profit_factor: float
+    net_r: float
+    max_drawdown_r: float
+    expectancy_r: float
+    score: float
+    robustness: float
+    verdict: str
+    trained_at: str
+    assets_tested: int = 0
+    r_values: List[float] = field(default_factory=list)
+
+
+strategies_db: Dict[str, dict] = {"strategies": {}, "results": {}}
+strategy_db_lock = asyncio.Lock()
+
+
+def load_strategies():
+    global strategies_db
+    if not os.path.exists(STRATEGY_DB_FILE):
+        return
+    try:
+        with open(STRATEGY_DB_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            strategies_db = {
+                "strategies": data.get("strategies", {}),
+                "results": data.get("results", {}),
+            }
+        logger.info("Loaded %s learned strategies", len(strategies_db["strategies"]))
+    except Exception:
+        logger.exception("Could not load strategy database")
+
+
+def save_strategies():
+    try:
+        tmp = STRATEGY_DB_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(strategies_db, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STRATEGY_DB_FILE)
+    except Exception:
+        logger.exception("Could not save strategy database")
+
+
+def extract_url(text: str) -> Optional[str]:
+    match = re.search(r"https?://[^\s<>\"]+", text or "", re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(0).rstrip(").,]}>\"'")
+
+
+def is_video_url(url: str) -> bool:
+    if not url:
+        return False
+    low = url.lower()
+    video_hosts = (
+        "youtube.com", "youtu.be", "youtube-nocookie.com",
+        "vimeo.com", "dailymotion.com", "tiktok.com",
+        "instagram.com", "facebook.com", "fb.watch"
+    )
+    return any(host in low for host in video_hosts)
+
+
+def clean_vtt_text(raw: str) -> str:
+    lines = []
+    previous = ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("WEBVTT") or line.startswith("NOTE") or "-->" in line:
+            continue
+        if re.fullmatch(r"\d+", line):
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"&nbsp;", " ", line)
+        line = re.sub(r"&amp;", "&", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or line == previous:
+            continue
+        lines.append(line)
+        previous = line
+    return "\n".join(lines)
+
+
+async def extract_video_text(url: str) -> str:
+    """
+    Extracts available subtitles only. It never claims that the video was watched.
+    If subtitles are unavailable, returns an empty string.
+    """
+    if not shutil.which(sys.executable):
+        return ""
+    with tempfile.TemporaryDirectory(prefix="strategy_video_") as tmp:
+        output_template = str(Path(tmp) / "%(id)s.%(ext)s")
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--skip-download",
+            "--write-auto-subs",
+            "--write-subs",
+            "--sub-langs", "en.*,ar.*,fr.*",
+            "--sub-format", "vtt",
+            "--no-warnings",
+            "--quiet",
+            "-o", output_template,
+            url,
+        ]
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=90,
+            )
+        except Exception as exc:
+            logger.warning("Video subtitle extraction failed: %s", exc)
+            return ""
+
+        if proc.returncode != 0:
+            logger.warning("yt-dlp failed: %s", (proc.stderr or "")[-500:])
+            return ""
+
+        parts = []
+        for vtt in Path(tmp).glob("*.vtt"):
+            try:
+                text = clean_vtt_text(vtt.read_text(encoding="utf-8", errors="ignore"))
+                if text:
+                    parts.append(text)
+            except Exception:
+                continue
+
+        if not parts:
+            return ""
+        # Avoid feeding the same auto-subtitle content repeatedly.
+        unique = []
+        seen = set()
+        for part in parts:
+            key = part[:1000]
+            if key not in seen:
+                seen.add(key)
+                unique.append(part)
+        return "\n".join(unique)[:30000]
+
+
+def extract_json_from_ai(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            data = json.loads(cleaned[start:end + 1])
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+SUPPORTED_RULE_PATTERNS = [
+    re.compile(r"^price\s*(>=|<=|>|<)\s*(ema20|ema50)$", re.I),
+    re.compile(r"^ema20\s*(>=|<=|>|<)\s*ema50$", re.I),
+    re.compile(r"^rsi\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)$", re.I),
+    re.compile(r"^macd\s*hist(?:ogram)?\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)$", re.I),
+    re.compile(r"^momentum6\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)$", re.I),
+]
+
+
+def normalize_rule(rule: str) -> str:
+    r = str(rule or "").strip()
+    r = r.replace(" ", "")
+    r = r.replace("MACDHistogram", "MACDhist").replace("macdhistogram", "MACDhist")
+    r = r.replace("EMA20", "EMA20").replace("EMA50", "EMA50")
+    r = r.replace("RSI", "RSI").replace("Price", "price").replace("PRICE", "price")
+    r = r.replace("Momentum6", "momentum6").replace("MOMENTUM6", "momentum6")
+    return r
+
+
+def rule_supported(rule: str) -> bool:
+    r = normalize_rule(rule)
+    return any(p.fullmatch(r) for p in SUPPORTED_RULE_PATTERNS)
+
+
+def evaluate_rule(rule: str, price: float, ema20_v: float, ema50_v: float,
+                  rsi_v: float, macd_hist_v: float, momentum6_v: float) -> bool:
+    r = normalize_rule(rule)
+    m = re.fullmatch(r"price(>=|<=|>|<)(ema20|ema50)", r, re.I)
+    if m:
+        left = price
+        right = ema20_v if m.group(2).lower() == "ema20" else ema50_v
+    else:
+        m = re.fullmatch(r"ema20(>=|<=|>|<)ema50", r, re.I)
+        if m:
+            left, right = ema20_v, ema50_v
+        else:
+            m = re.fullmatch(r"rsi(>=|<=|>|<)(-?\d+(?:\.\d+)?)", r, re.I)
+            if m:
+                left, right = rsi_v, float(m.group(2))
+            else:
+                m = re.fullmatch(r"macdhist(?:ogram)?(>=|<=|>|<)(-?\d+(?:\.\d+)?)", r, re.I)
+                if m:
+                    left, right = macd_hist_v, float(m.group(2))
+                else:
+                    m = re.fullmatch(r"momentum6(>=|<=|>|<)(-?\d+(?:\.\d+)?)", r, re.I)
+                    if m:
+                        left, right = momentum6_v, float(m.group(2))
+                    else:
+                        raise ValueError(f"Unsupported rule: {rule}")
+
+    op = m.group(1)
+    if op == ">":
+        return left > right
+    if op == "<":
+        return left < right
+    if op == ">=":
+        return left >= right
+    if op == "<=":
+        return left <= right
+    return False
+
+
+async def convert_content_to_strategy(source_url: str, source_text: str) -> Optional[StrategyDefinition]:
+    prompt = f"""
+أنت مهندس استراتيجيات تداول. استخرج فقط استراتيجية قابلة للاختبار من المحتوى التالي.
+لا تخترع قواعد غير موجودة في المصدر. إذا كانت قاعدة غير قابلة للتمثيل بالقواعد المدعومة أدناه، ضعها في unsupported_rules ولا تضعها داخل buy_rules أو sell_rules.
+
+القواعد المدعومة حرفيًا فقط:
+- price>EMA20 / price<EMA20 / price>=EMA20 / price<=EMA20
+- price>EMA50 / price<EMA50 / price>=EMA50 / price<=EMA50
+- EMA20>EMA50 / EMA20<EMA50 / EMA20>=EMA50 / EMA20<=EMA50
+- RSI>NUMBER / RSI<NUMBER / RSI>=NUMBER / RSI<=NUMBER
+- MACDhist>NUMBER / MACDhist<NUMBER / MACDhist>=NUMBER / MACDhist<=NUMBER
+- momentum6>NUMBER / momentum6<NUMBER / momentum6>=NUMBER / momentum6<=NUMBER
+
+أخرج JSON فقط:
+{{
+  "name": "اسم الاستراتيجية",
+  "description": "وصف قصير دقيق",
+  "indicators": ["EMA20", "RSI"],
+  "buy_rules": ["price>EMA20"],
+  "sell_rules": ["price<EMA20"],
+  "unsupported_rules": [],
+  "sl_atr": 1.2,
+  "tp_atr": 1.6,
+  "max_hold_bars": 12
+}}
+
+مهم:
+- buy_rules وsell_rules يجب أن تحتويان على كل الشروط اللازمة كما وردت في المصدر.
+- إذا لم توجد استراتيجية واضحة، أعد "buy_rules":[] و"sell_rules":[].
+- sl_atr وtp_atr يجب أن يعكسا المصدر إن كان واضحًا. إذا لم يذكر المصدر قيمًا، استخدم 1.2 و1.6 فقط كإعداد اختبار قياسي، واذكر ذلك في description.
+- لا تدّع أنك شاهدت الفيديو؛ المصدر المتاح هو النص فقط.
+
+SOURCE URL:
+{source_url}
+
+SOURCE CONTENT:
+{source_text[:30000]}
+"""
+    ai = await safe_ai_generate(prompt)
+    data = extract_json_from_ai(ai)
+    if not data:
+        return None
+
+    buy_rules = [normalize_rule(x) for x in data.get("buy_rules", []) if str(x).strip()]
+    sell_rules = [normalize_rule(x) for x in data.get("sell_rules", []) if str(x).strip()]
+    unsupported = [str(x) for x in data.get("unsupported_rules", []) if str(x).strip()]
+
+    for rule in buy_rules + sell_rules:
+        if not rule_supported(rule):
+            unsupported.append(rule)
+
+    if not buy_rules and not sell_rules:
+        return None
+    if unsupported:
+        # Do not silently backtest an incomplete strategy.
+        logger.warning("Strategy contains unsupported rules: %s", unsupported)
+        return None
+
+    try:
+        sl_atr = float(data.get("sl_atr", 1.2))
+        tp_atr = float(data.get("tp_atr", 1.6))
+        max_hold = int(data.get("max_hold_bars", 12))
+    except (TypeError, ValueError):
+        sl_atr, tp_atr, max_hold = 1.2, 1.6, 12
+
+    if sl_atr <= 0 or tp_atr <= 0 or max_hold < 1:
+        return None
+
+    now = now_local().isoformat()
+    sid = "STR-" + uuid.uuid4().hex[:8].upper()
+    return StrategyDefinition(
+        id=sid,
+        name=str(data.get("name") or "Learned Strategy")[:120],
+        source_url=source_url,
+        source_text=source_text[:30000],
+        description=str(data.get("description") or "")[:1500],
+        indicators=[str(x) for x in data.get("indicators", [])][:20],
+        buy_rules=buy_rules,
+        sell_rules=sell_rules,
+        sl_atr=sl_atr,
+        tp_atr=tp_atr,
+        max_hold_bars=max_hold,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def strategy_signal(strategy: StrategyDefinition, candles: List[dict], index: int) -> Optional[str]:
+    if index < 60 or index >= len(candles):
+        return None
+    closes = [x["close"] for x in candles[:index + 1]]
+    highs = [x["high"] for x in candles[:index + 1]]
+    lows = [x["low"] for x in candles[:index + 1]]
+    price = closes[-1]
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    rr = rsi(closes, 14)
+    aa = atr(highs, lows, closes, 14)
+    _, _, mh = macd(closes)
+    momentum6 = price - closes[-7] if len(closes) >= 7 else 0.0
+    if None in (e20, e50, rr, aa, mh) or aa <= 0:
+        return None
+
+    try:
+        if strategy.buy_rules and all(
+            evaluate_rule(rule, price, e20, e50, rr, mh, momentum6)
+            for rule in strategy.buy_rules
+        ):
+            return "BUY"
+        if strategy.sell_rules and all(
+            evaluate_rule(rule, price, e20, e50, rr, mh, momentum6)
+            for rule in strategy.sell_rules
+        ):
+            return "SELL"
+    except ValueError:
+        return None
+    return None
+
+
+def simulate_strategy_test(strategy: StrategyDefinition, candles: List[dict], start_index: int) -> float:
+    if start_index < 60 or start_index >= len(candles) - 1:
+        return 0.0
+    side = strategy_signal(strategy, candles, start_index)
+    if side is None:
+        return 0.0
+
+    closes = [x["close"] for x in candles[:start_index + 1]]
+    highs = [x["high"] for x in candles[:start_index + 1]]
+    lows = [x["low"] for x in candles[:start_index + 1]]
+    price = closes[-1]
+    aa = atr(highs, lows, closes, 14)
+    if aa is None or aa <= 0:
+        return 0.0
+
+    if side == "BUY":
+        sl = price - aa * strategy.sl_atr
+        tp = price + aa * strategy.tp_atr
+    else:
+        sl = price + aa * strategy.sl_atr
+        tp = price - aa * strategy.tp_atr
+
+    end = min(len(candles), start_index + 1 + strategy.max_hold_bars)
+    for j in range(start_index + 1, end):
+        bar = candles[j]
+        # Conservative rule: if both levels are touched in one candle,
+        # count SL first because OHLC does not reveal intrabar order.
+        if side == "BUY":
+            if bar["low"] <= sl:
+                return -1.0
+            if bar["high"] >= tp:
+                return strategy.tp_atr / strategy.sl_atr
+        else:
+            if bar["high"] >= sl:
+                return -1.0
+            if bar["low"] <= tp:
+                return strategy.tp_atr / strategy.sl_atr
+    return 0.0
+
+
+def calculate_strategy_metrics(strategy_id: str, r_values: List[float], tests: int, assets_tested: int) -> StrategyResult:
+    trades = [r for r in r_values if r != 0.0]
+    wins = [r for r in trades if r > 0]
+    losses = [r for r in trades if r < 0]
+    neutral = tests - len(trades)
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    pf = gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
+    win_rate = (len(wins) / len(trades) * 100.0) if trades else 0.0
+    net_r = sum(trades)
+    expectancy = net_r / len(trades) if trades else 0.0
+
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in r_values:
+        equity += r
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+
+    sample_factor = min(1.0, len(trades) / 50.0)
+    pf_factor = min(1.0, max(pf, 0.0) / 2.0)
+    wr_factor = min(1.0, win_rate / 70.0)
+    dd_factor = max(0.0, 1.0 - max_dd / max(5.0, abs(net_r) + 5.0))
+    expectancy_factor = min(1.0, max(0.0, expectancy) / 0.6)
+    score = 100.0 * (
+        0.25 * pf_factor +
+        0.20 * wr_factor +
+        0.20 * max(0.0, min(1.0, (net_r + 10.0) / 40.0)) +
+        0.15 * dd_factor +
+        0.10 * expectancy_factor +
+        0.10 * sample_factor
+    )
+    robustness = 100.0 * (
+        0.6 * sample_factor +
+        0.4 * max(0.0, min(1.0, assets_tested / max(1, len(ASSETS))))
+    )
+
+    if len(trades) < STRATEGY_MIN_TRADES:
+        verdict = "INSUFFICIENT DATA"
+    elif score >= 80 and pf >= 1.5 and net_r > 0:
+        verdict = "STRONG"
+    elif score >= 65 and pf >= 1.15 and net_r > 0:
+        verdict = "PROMISING"
+    elif score >= 50:
+        verdict = "WEAK"
+    else:
+        verdict = "FAILED"
+
+    return StrategyResult(
+        strategy_id=strategy_id,
+        tests=tests,
+        trades=len(trades),
+        wins=len(wins),
+        losses=len(losses),
+        neutral=neutral,
+        win_rate=round(win_rate, 2),
+        profit_factor=round(pf, 3),
+        net_r=round(net_r, 3),
+        max_drawdown_r=round(max_dd, 3),
+        expectancy_r=round(expectancy, 4),
+        score=round(score, 2),
+        robustness=round(robustness, 2),
+        verdict=verdict,
+        trained_at=now_local().isoformat(),
+        assets_tested=assets_tested,
+        r_values=[round(x, 6) for x in r_values],
+    )
+
+
+async def train_strategy(strategy: StrategyDefinition) -> StrategyResult:
+    async with STRATEGY_TRAINING_LOCK:
+        training_status.update({
+            "running": True,
+            "strategy_id": strategy.id,
+            "strategy_name": strategy.name,
+            "tests": 0,
+            "trades": 0,
+            "message": "loading historical candles",
+        })
+        all_r = []
+        assets_tested = 0
+
+        try:
+            for asset_key, cfg in ASSETS.items():
+                try:
+                    candles = await get_time_series(cfg["symbol"], 500)
+                    max_index = len(candles) - strategy.max_hold_bars - 1
+                    first_index = 60
+                    if max_index <= first_index:
+                        continue
+
+                    available = max_index - first_index + 1
+                    count = min(TRAINING_TESTS, available)
+
+                    # Evenly distributed walk-forward samples across the history.
+                    if count == 1:
+                        indices = [first_index]
+                    else:
+                        indices = sorted(set(
+                            first_index + round(i * (available - 1) / (count - 1))
+                            for i in range(count)
+                        ))
+
+                    for idx in indices:
+                        r = simulate_strategy_test(strategy, candles, idx)
+                        all_r.append(r)
+
+                    assets_tested += 1
+                    training_status["tests"] = len(all_r)
+                    training_status["trades"] = sum(1 for x in all_r if x != 0.0)
+                    training_status["message"] = f"testing {asset_key}"
+                except Exception as exc:
+                    logger.warning("Strategy training failed on %s: %s", asset_key, exc)
+
+            result = calculate_strategy_metrics(strategy.id, all_r, len(all_r), assets_tested)
+            strategies_db["results"][strategy.id] = asdict(result)
+            strategies_db["strategies"][strategy.id] = asdict(strategy)
+            save_strategies()
+            return result
+        finally:
+            training_status["running"] = False
+            training_status["message"] = "complete"
+
+
+def strategy_from_db(strategy_id: str) -> Optional[StrategyDefinition]:
+    raw = strategies_db.get("strategies", {}).get(strategy_id)
+    if not raw:
+        return None
+    try:
+        return StrategyDefinition(**raw)
+    except Exception:
+        logger.exception("Invalid strategy record %s", strategy_id)
+        return None
+
+
+def result_from_db(strategy_id: str) -> Optional[StrategyResult]:
+    raw = strategies_db.get("results", {}).get(strategy_id)
+    if not raw:
+        return None
+    try:
+        return StrategyResult(**raw)
+    except Exception:
+        return None
+
+
+def strategy_display(strategy: StrategyDefinition, result: Optional[StrategyResult]) -> str:
+    lines = [
+        f"🧠 {strategy.name}",
+        f"ID: {strategy.id}",
+        f"الوصف: {strategy.description or 'غير متوفر'}",
+        f"Indicators: {', '.join(strategy.indicators) if strategy.indicators else '—'}",
+        f"BUY rules: {', '.join(strategy.buy_rules) if strategy.buy_rules else '—'}",
+        f"SELL rules: {', '.join(strategy.sell_rules) if strategy.sell_rules else '—'}",
+        f"SL ATR: {strategy.sl_atr}",
+        f"TP ATR: {strategy.tp_atr}",
+        f"Max hold: {strategy.max_hold_bars} bars",
+    ]
+    if result:
+        lines += [
+            "",
+            "نتيجة التدريب:",
+            f"Tests: {result.tests}",
+            f"Trades: {result.trades}",
+            f"Wins/Losses: {result.wins}/{result.losses}",
+            f"Win rate: {result.win_rate}%",
+            f"Profit factor: {result.profit_factor}",
+            f"Net R: {result.net_r}",
+            f"Max drawdown R: {result.max_drawdown_r}",
+            f"Expectancy R: {result.expectancy_r}",
+            f"Score: {result.score}/100",
+            f"Robustness: {result.robustness}/100",
+            f"Verdict: {result.verdict}",
+            f"Assets tested: {result.assets_tested}",
+            f"Trained: {result.trained_at}",
+        ]
+    return "\n".join(lines)
+
+
+async def process_strategy_video(message: types.Message, url: str, original_text: str):
+    await safe_send(message, "🎥 تم اكتشاف رابط فيديو. أحاول استخراج الترجمة/النص المتاح ثم تحويله إلى استراتيجية قابلة للاختبار...")
+
+    transcript = await extract_video_text(url)
+    if not transcript:
+        await safe_send(
+            message,
+            "❌ لم أستطع استخراج نص/ترجمة من الفيديو.\n"
+            "لم أشاهد الفيديو ولم أختلق محتواه.\n"
+            "أرسل رابط فيديو يحتوي على ترجمة متاحة، أو أرسل نص الاستراتيجية مباشرة."
+        )
+        return
+
+    strategy = await convert_content_to_strategy(url, transcript)
+    if not strategy:
+        await safe_send(
+            message,
+            "❌ تم استخراج النص، لكن لم أستطع تحويله إلى قواعد تداول قابلة للاختبار "
+            "بالصيغة المدعومة دون اختراع قواعد."
+        )
+        return
+
+    strategies_db["strategies"][strategy.id] = asdict(strategy)
+    save_strategies()
+
+    await safe_send(
+        message,
+        f"🧠 تم استخراج الاستراتيجية: {strategy.name}\n"
+        f"ID: {strategy.id}\n\n"
+        f"🧪 سأختبرها على الأقل {TRAINING_TESTS} حالة تاريخية لكل أصل متاح "
+        f"وفي منطقة التدريب فقط. لن تدخل هذه الاستراتيجية في التداول الحي تلقائيًا."
+    )
+
+    try:
+        result = await train_strategy(strategy)
+        await safe_send(
+            message,
+            strategy_display(strategy, result)
+            + "\n\n⚠️ الاختبار تاريخي، والنتيجة لا تضمن الأداء المستقبلي."
+        )
+    except Exception as exc:
+        logger.exception("Strategy training failed")
+        await safe_send(message, f"❌ فشل تدريب الاستراتيجية: {str(exc)[:700]}")
+
+
+def top_strategies(limit: int = 10):
+    rows = []
+    for sid, raw in strategies_db.get("results", {}).items():
+        try:
+            result = StrategyResult(**raw)
+            strategy = strategy_from_db(sid)
+            if strategy:
+                rows.append((strategy, result))
+        except Exception:
+            continue
+    rows.sort(key=lambda pair: (pair[1].score, pair[1].profit_factor, pair[1].net_r), reverse=True)
+    return rows[:limit]
+
+
+# ============================================================
 # NEWS / FORWARDED TEXT
 # ============================================================
 def detect_assets_in_text(text: str) -> List[str]:
@@ -878,39 +1630,55 @@ def detect_assets_in_text(text: str) -> List[str]:
     return found
 
 async def process_news_or_strategy(message: types.Message, text: str):
-    forward_origin = getattr(message,"forward_origin",None)
+    forward_origin = getattr(message, "forward_origin", None)
     is_forward = forward_origin is not None
-    is_url = "http://" in text or "https://" in text
-    is_strategy = is_url or "استراتيجية" in text.lower() or "strategy" in text.lower()
-    kind = "خبر مُعاد توجيهه" if is_forward else ("رابط/استراتيجية" if is_strategy else "خبر")
-    await safe_send(message,f"🧠 جاري تحليل {kind}...")
-    prompt=f"""
+    url = extract_url(text)
+    if url and is_video_url(url):
+        await process_strategy_video(message, url, text)
+        return
+
+    is_strategy_text = "استراتيجية" in text.lower() or "strategy" in text.lower()
+    kind = "خبر مُعاد توجيهه" if is_forward else ("استراتيجية/نص" if is_strategy_text else "خبر")
+    await safe_send(message, f"🧠 جاري تحليل {kind}...")
+
+    prompt = f"""
 حلل النص التالي كمحلل مخاطر للأسواق. لا تخترع تفاصيل.
 النص:
 {text}
-حدد: نوع المحتوى، الأصول المتأثرة، اتجاه التأثير bullish/bearish/mixed/unknown، قوة 1-5، المدة دقائق/ساعات/أيام، وما يجب مراقبته.
-لا تضمن الربح. إذا كان رابط فيديو فلا تدّع أنك شاهدت الفيديو ما لم يتوفر محتواه فعليًا.
+حدد: نوع المحتوى، الأصول المتأثرة، اتجاه التأثير bullish/bearish/mixed/unknown،
+قوة 1-5، المدة دقائق/ساعات/أيام، وما يجب مراقبته.
+لا تضمن الربح.
+إذا كان النص يحتوي رابط فيديو ولم يتوفر محتواه الفعلي، لا تدّع أنك شاهدت الفيديو.
 """
-    ai=await safe_ai_generate(prompt) or "تعذر الوصول إلى Gemini حاليًا. تم استلام النص ويمكن إعادة المحاولة."
-    os.makedirs("memory",exist_ok=True)
-    filename="memory/strategies_memory.txt" if is_strategy else "memory/news_memory.txt"
+    ai = await safe_ai_generate(prompt) or "تعذر الوصول إلى Gemini حاليًا. تم استلام النص ويمكن إعادة المحاولة."
+
+    os.makedirs("memory", exist_ok=True)
+    filename = "memory/strategies_memory.txt" if is_strategy_text else "memory/news_memory.txt"
     try:
-        with open(filename,"a",encoding="utf-8") as f:
-            f.write(f"\n[{now_local().isoformat()}]\nTYPE: {kind}\nTEXT:\n{text}\nANALYSIS:\n{ai}\n"+"="*70+"\n")
+        with open(filename, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n[{now_local().isoformat()}]\nTYPE: {kind}\nTEXT:\n{text}\n"
+                f"ANALYSIS:\n{ai}\n" + "=" * 70 + "\n"
+            )
     except Exception:
         logger.exception("Could not save memory")
-    await safe_send(message,f"📰 تحليل {kind}\n\n{ai}")
-    affected=detect_assets_in_text(text)
-    for trade in [t for t in list(open_trades.values()) if t.status=="OPEN" and t.asset_key in affected]:
+
+    await safe_send(message, f"📰 تحليل {kind}\n\n{ai}")
+
+    affected = detect_assets_in_text(text)
+    for trade in [t for t in list(open_trades.values()) if t.status == "OPEN" and t.asset_key in affected]:
         try:
-            old=trade.status
-            trade,analysis,events=await reanalyze_trade(trade,reason="news")
-            await safe_reply(trade.chat_id,
+            trade, analysis, events = await reanalyze_trade(trade, reason="news")
+            await safe_reply(
+                trade.chat_id,
                 f"⚡ إعادة تحليل فورية بسبب خبر\nالأصل: {trade.asset_name}\nTrade ID: {trade.id}\n"
-                f"السعر: {format_price(analysis.price)}\nالإشارة: {analysis.signal}\nالحالة: {trade.status}\n"
-                f"الإجراء: {trade.last_action}\nTP events: {', '.join(events) if events else 'none'}")
+                f"السعر: {format_price(analysis.price)}\nالإشارة: {analysis.signal}\n"
+                f"الحالة: {trade.status}\nالإجراء: {trade.last_action}\n"
+                f"TP events: {', '.join(events) if events else 'none'}"
+            )
         except Exception:
             logger.exception("News reanalysis failed")
+
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
@@ -1014,6 +1782,7 @@ async def start_web_server():
 # ============================================================
 async def main():
     load_state()
+    load_strategies()
     if not TWELVE_DATA_API_KEY: logger.warning("TWELVE_DATA_API_KEY is missing.")
     if not GEMINI_KEYS: logger.warning("No Gemini API keys configured.")
     runner=await start_web_server()
