@@ -1,60 +1,51 @@
 import os
 import asyncio
 import logging
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, types
+
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+
 from google import genai
 
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
+# ============================================================
+# CONFIG
+# ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Example:
-# GEMINI_API_KEYS=KEY1,KEY2,KEY3,KEY4,KEY5,KEY6,KEY7
 GEMINI_KEYS_RAW = os.getenv("GEMINI_API_KEYS", "")
-
 GEMINI_KEYS = [
     key.strip()
     for key in GEMINI_KEYS_RAW.split(",")
     if key.strip()
 ]
 
-# Main model.
-# You can change it from Render Environment Variables.
+# Google currently documents Gemini 3.8 Flash for generate_content.
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.6-flash"
+    "gemini-3.8-flash"
 ).strip()
-
-# Automatic model fallbacks.
-MODEL_FALLBACKS = [
-    GEMINI_MODEL,
-    "gemini-3.6-flash",
-    "gemini-3.7-flash",
-    "gemini-3.8-flash",
-]
-
-# Remove duplicates while preserving order.
-MODEL_FALLBACKS = list(dict.fromkeys(MODEL_FALLBACKS))
 
 PORT = int(os.getenv("PORT", "10000"))
 
-NEWS_FILE = Path("news_memory.txt")
-STRATEGY_FILE = Path("strategies_memory.txt")
-ERROR_FILE = Path("bot_errors.log")
+BASE_DIR = Path(__file__).resolve().parent
+
+NEWS_FILE = BASE_DIR / "news_memory.txt"
+STRATEGY_FILE = BASE_DIR / "strategies_memory.txt"
+
+MAX_TELEGRAM_MESSAGE_LENGTH = 3900
 
 
-# =========================================================
+# ============================================================
 # LOGGING
-# =========================================================
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,43 +55,39 @@ logging.basicConfig(
 logger = logging.getLogger("TradingBot")
 
 
-# =========================================================
+# ============================================================
 # BASIC VALIDATION
-# =========================================================
+# ============================================================
 
 if not BOT_TOKEN:
-    logger.warning("BOT_TOKEN is not configured.")
+    logger.error("BOT_TOKEN is missing.")
 
 if not GEMINI_KEYS:
-    logger.warning("GEMINI_API_KEYS is not configured.")
+    logger.warning("No GEMINI_API_KEYS were found.")
 
-logger.info(
-    "Loaded %s Gemini API key(s).",
-    len(GEMINI_KEYS)
+
+# ============================================================
+# TELEGRAM BOT
+# IMPORTANT:
+# parse_mode=None means Telegram will NOT parse Markdown/HTML.
+# This prevents:
+#   can't parse entities
+#   Can't find end of the entity
+# ============================================================
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(
+        parse_mode=None
+    )
 )
 
-logger.info(
-    "Gemini primary model: %s",
-    GEMINI_MODEL
-)
-
-logger.info(
-    "Gemini model fallbacks: %s",
-    ", ".join(MODEL_FALLBACKS)
-)
-
-
-# =========================================================
-# TELEGRAM
-# =========================================================
-
-bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 dp = Dispatcher()
 
 
-# =========================================================
+# ============================================================
 # GEMINI KEY MANAGER
-# =========================================================
+# ============================================================
 
 class KeyManager:
 
@@ -110,59 +97,53 @@ class KeyManager:
         self.cooldowns = {}
         self.lock = asyncio.Lock()
 
-    def count(self):
-        return len(self.keys)
-
     async def get_available_key(self):
-        """
-        Returns:
-            (index, key)
-        or
-            (None, None)
-        """
-
         if not self.keys:
             return None, None
 
         async with self.lock:
 
-            now = time.time()
+            now = asyncio.get_running_loop().time()
 
-            # Try every key starting from current index.
-            for offset in range(len(self.keys)):
+            for _ in range(len(self.keys)):
 
-                index = (
-                    self.current_index + offset
-                ) % len(self.keys)
+                index = self.current_index % len(self.keys)
 
-                cooldown_until = self.cooldowns.get(
-                    index,
-                    0
-                )
+                cooldown_until = self.cooldowns.get(index, 0)
 
                 if cooldown_until <= now:
+                    key = self.keys[index]
+                    return index, key
 
-                    self.current_index = (
-                        index + 1
-                    ) % len(self.keys)
-
-                    return index, self.keys[index]
+                self.current_index = (
+                    self.current_index + 1
+                ) % len(self.keys)
 
             return None, None
 
-    async def cooldown(
-        self,
-        index,
-        seconds=60
-    ):
+    async def rotate(self):
+        if not self.keys:
+            return
+
+        async with self.lock:
+            self.current_index = (
+                self.current_index + 1
+            ) % len(self.keys)
+
+    async def cooldown(self, index, seconds=30):
+
         if index is None:
             return
 
         async with self.lock:
 
-            self.cooldowns[index] = (
-                time.time() + seconds
-            )
+            now = asyncio.get_running_loop().time()
+
+            self.cooldowns[index] = now + seconds
+
+            self.current_index = (
+                index + 1
+            ) % len(self.keys)
 
             logger.warning(
                 "Gemini key #%s placed in cooldown for %s seconds.",
@@ -170,269 +151,126 @@ class KeyManager:
                 seconds
             )
 
-    async def reset_cooldown(self, index):
-
-        if index is None:
-            return
-
-        async with self.lock:
-            self.cooldowns.pop(index, None)
-
 
 key_manager = KeyManager(GEMINI_KEYS)
 
 
-# =========================================================
-# GEMINI CLIENT
-# =========================================================
+# ============================================================
+# GEMINI
+# ============================================================
 
-def create_client(api_key):
-    return genai.Client(
-        api_key=api_key
-    )
-
-
-# =========================================================
-# ERROR CLASSIFICATION
-# =========================================================
-
-def error_text(error):
-    try:
-        return str(error).lower()
-    except Exception:
-        return ""
-
-
-def is_model_error(error):
-    text = error_text(error)
-
-    return (
-        "404" in text
-        and (
-            "model" in text
-            or "not_found" in text
-            or "not found" in text
-        )
-    )
-
-
-def is_rate_limit_error(error):
-    text = error_text(error)
-
-    return (
-        "429" in text
-        or "resource_exhausted" in text
-        or "rate limit" in text
-        or "quota" in text
-    )
-
-
-def is_auth_error(error):
-    text = error_text(error)
-
-    return (
-        "401" in text
-        or "403" in text
-        or "permission denied" in text
-        or "api key" in text
-        and "invalid" in text
-    )
-
-
-def is_server_error(error):
-    text = error_text(error)
-
-    return (
-        "500" in text
-        or "502" in text
-        or "503" in text
-        or "504" in text
-        or "internal server error" in text
-        or "service unavailable" in text
-    )
-
-
-# =========================================================
-# SAVE ERRORS
-# =========================================================
-
-def save_error(error):
-
-    try:
-
-        with ERROR_FILE.open(
-            "a",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(
-                f"\n[{datetime.now().isoformat()}]\n"
-            )
-
-            f.write(
-                f"{repr(error)}\n"
-            )
-
-            f.write(
-                "=" * 60 + "\n"
-            )
-
-    except Exception:
-        pass
-
-
-# =========================================================
-# GEMINI GENERATION
-# =========================================================
-
-async def safe_ai_generate(
-    prompt,
-    fallback_text=None
-):
+async def gemini_generate(prompt: str) -> str:
 
     if not GEMINI_KEYS:
-
         return (
-            fallback_text
-            or
-            "❌ لا توجد مفاتيح Gemini في إعدادات Render."
+            "⚠️ Gemini غير متاح حاليًا.\n"
+            "لم يتم العثور على GEMINI_API_KEYS في Render."
         )
+
+    if not prompt:
+        return "⚠️ لم يتم إرسال محتوى للتحليل."
 
     last_error = None
 
-    # We try several model/key combinations.
-    #
-    # Important:
-    # A 404 model error does NOT put the key in cooldown.
-    # This avoids wasting all 7 keys when the model itself is wrong.
+    # Try every available key.
+    for attempt in range(max(3, len(GEMINI_KEYS) * 2)):
 
-    for model in MODEL_FALLBACKS:
+        key_index, api_key = await key_manager.get_available_key()
 
-        for attempt in range(
-            max(1, len(GEMINI_KEYS) * 2)
-        ):
+        if api_key is None:
 
-            key_index, api_key = (
-                await key_manager.get_available_key()
+            # All keys temporarily unavailable.
+            await asyncio.sleep(2)
+            continue
+
+        try:
+
+            client = genai.Client(
+                api_key=api_key
             )
 
-            if api_key is None:
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt
+            )
 
-                # All keys are temporarily cooling down.
-                await asyncio.sleep(2)
+            text = getattr(response, "text", None)
 
-                key_index, api_key = (
-                    await key_manager.get_available_key()
+            if text:
+
+                text = str(text).strip()
+
+                if text:
+                    return text
+
+            last_error = "Gemini returned an empty response."
+
+            await key_manager.rotate()
+
+        except Exception as exc:
+
+            last_error = exc
+
+            error_text = str(exc).lower()
+
+            logger.error(
+                "Gemini attempt failed using key #%s: %s",
+                (key_index + 1) if key_index is not None else "?",
+                exc
+            )
+
+            # Quota / rate-limit errors.
+            if any(
+                phrase in error_text
+                for phrase in [
+                    "429",
+                    "quota",
+                    "rate limit",
+                    "resource exhausted",
+                    "too many requests"
+                ]
+            ):
+                await key_manager.cooldown(
+                    key_index,
+                    30
                 )
 
-                if api_key is None:
-                    continue
-
-            try:
-
-                logger.info(
-                    "Gemini request | model=%s | key=%s",
-                    model,
-                    key_index + 1
+            # Authentication errors.
+            elif any(
+                phrase in error_text
+                for phrase in [
+                    "401",
+                    "403",
+                    "api key",
+                    "permission",
+                    "unauthorized"
+                ]
+            ):
+                await key_manager.cooldown(
+                    key_index,
+                    300
                 )
 
-                client = create_client(api_key)
-
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=model,
-                    contents=prompt
-                )
-
-                if response:
-
-                    text = getattr(
-                        response,
-                        "text",
-                        None
-                    )
-
-                    if text and text.strip():
-
-                        await key_manager.reset_cooldown(
-                            key_index
-                        )
-
-                        return text.strip()
-
-                last_error = Exception(
-                    "Gemini returned an empty response."
-                )
-
-            except Exception as error:
-
-                last_error = error
-
-                save_error(error)
-
+            # Model not found.
+            elif (
+                "404" in error_text
+                or "not found" in error_text
+                or "not available" in error_text
+            ):
                 logger.error(
-                    "Gemini error | model=%s | key=%s | %s",
-                    model,
-                    key_index + 1,
-                    error
+                    "Gemini model '%s' is unavailable. "
+                    "Check GEMINI_MODEL.",
+                    GEMINI_MODEL
                 )
 
-                # -------------------------------------------------
-                # MODEL ERROR
-                # -------------------------------------------------
+                # Do NOT mark the key as bad.
+                await key_manager.rotate()
 
-                if is_model_error(error):
+            else:
+                await key_manager.rotate()
 
-                    logger.warning(
-                        "Model %s is unavailable. Trying another model.",
-                        model
-                    )
-
-                    # DO NOT cooldown the key.
-                    break
-
-                # -------------------------------------------------
-                # RATE LIMIT / QUOTA
-                # -------------------------------------------------
-
-                if is_rate_limit_error(error):
-
-                    await key_manager.cooldown(
-                        key_index,
-                        seconds=60
-                    )
-
-                    continue
-
-                # -------------------------------------------------
-                # AUTHENTICATION
-                # -------------------------------------------------
-
-                if is_auth_error(error):
-
-                    # Keep the key out for longer.
-                    await key_manager.cooldown(
-                        key_index,
-                        seconds=300
-                    )
-
-                    continue
-
-                # -------------------------------------------------
-                # SERVER ERROR
-                # -------------------------------------------------
-
-                if is_server_error(error):
-
-                    await asyncio.sleep(2)
-
-                    continue
-
-                # -------------------------------------------------
-                # OTHER ERROR
-                # -------------------------------------------------
-
-                await asyncio.sleep(1)
+            await asyncio.sleep(1)
 
     logger.error(
         "All Gemini attempts failed. Last error: %s",
@@ -440,41 +278,239 @@ async def safe_ai_generate(
     )
 
     return (
-        fallback_text
-        or
-        "❌ تعذر تحليل الطلب بواسطة Gemini حاليًا. "
-        "تم تسجيل الخطأ للمراجعة."
+        "⚠️ تعذر الحصول على رد من Gemini حاليًا.\n"
+        "تمت محاولة مفاتيح Gemini المتاحة."
     )
 
 
-# =========================================================
-# WEB SERVER FOR RENDER
-# =========================================================
+# ============================================================
+# TELEGRAM SAFE SENDING
+# ============================================================
+
+def split_text(text: str, limit=MAX_TELEGRAM_MESSAGE_LENGTH):
+
+    if text is None:
+        return [""]
+
+    text = str(text)
+
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+
+    remaining = text
+
+    while len(remaining) > limit:
+
+        # Prefer splitting at newline.
+        cut = remaining.rfind(
+            "\n",
+            0,
+            limit
+        )
+
+        if cut < 500:
+            cut = remaining.rfind(
+                " ",
+                0,
+                limit
+            )
+
+        if cut < 1:
+            cut = limit
+
+        chunks.append(
+            remaining[:cut]
+        )
+
+        remaining = remaining[cut:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
+
+
+async def safe_answer(
+    message: types.Message,
+    text: str
+):
+
+    """
+    Telegram-safe sender.
+
+    No Markdown.
+    No MarkdownV2.
+    No HTML.
+
+    This completely avoids Telegram entity parsing errors.
+    """
+
+    if text is None:
+        text = ""
+
+    text = str(text)
+
+    chunks = split_text(text)
+
+    sent_messages = []
+
+    for chunk in chunks:
+
+        try:
+
+            sent = await message.answer(
+                chunk,
+                parse_mode=None
+            )
+
+            sent_messages.append(sent)
+
+        except TelegramBadRequest as exc:
+
+            logger.error(
+                "Telegram BadRequest while sending message: %s",
+                exc
+            )
+
+            # Last-resort cleanup.
+            # Remove NUL/control characters.
+            cleaned = "".join(
+                char
+                for char in chunk
+                if char == "\n"
+                or char == "\t"
+                or ord(char) >= 32
+            )
+
+            try:
+
+                sent = await message.answer(
+                    cleaned,
+                    parse_mode=None
+                )
+
+                sent_messages.append(sent)
+
+            except Exception as second_error:
+
+                logger.exception(
+                    "Second Telegram send attempt failed: %s",
+                    second_error
+                )
+
+        except TelegramNetworkError as exc:
+
+            logger.error(
+                "Telegram network error: %s",
+                exc
+            )
+
+            await asyncio.sleep(2)
+
+            try:
+
+                sent = await message.answer(
+                    chunk,
+                    parse_mode=None
+                )
+
+                sent_messages.append(sent)
+
+            except Exception as retry_error:
+
+                logger.exception(
+                    "Telegram retry failed: %s",
+                    retry_error
+                )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Unexpected Telegram send error: %s",
+                exc
+            )
+
+    return sent_messages
+
+
+# ============================================================
+# FILE MEMORY
+# ============================================================
+
+def save_memory(
+    file_path: Path,
+    title: str,
+    content: str
+):
+
+    try:
+
+        with open(
+            file_path,
+            "a",
+            encoding="utf-8"
+        ) as file:
+
+            file.write(
+                "\n"
+                + "=" * 60
+                + "\n"
+            )
+
+            file.write(
+                f"[{datetime.now(timezone.utc).isoformat()}]\n"
+            )
+
+            file.write(
+                f"{title}\n\n"
+            )
+
+            file.write(
+                str(content)
+            )
+
+            file.write("\n")
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not save memory file: %s",
+            exc
+        )
+
+
+# ============================================================
+# HEALTH SERVER
+# ============================================================
 
 async def health(request):
+
+    return web.Response(
+        text="Trading Bot is running."
+    )
+
+
+async def status(request):
+
+    gemini_status = (
+        "configured"
+        if GEMINI_KEYS
+        else "missing"
+    )
 
     return web.json_response(
         {
             "status": "online",
-            "service": "Trading Bot",
-            "gemini_keys": len(GEMINI_KEYS),
+            "telegram": "polling",
+            "gemini": gemini_status,
             "gemini_model": GEMINI_MODEL,
-            "models": MODEL_FALLBACKS,
-            "time": datetime.now(
+            "gemini_keys": len(GEMINI_KEYS),
+            "time_utc": datetime.now(
                 timezone.utc
             ).isoformat()
         }
-    )
-
-
-async def home(request):
-
-    return web.Response(
-        text=(
-            "Trading Bot is online.\n"
-            f"Gemini keys: {len(GEMINI_KEYS)}\n"
-            f"Primary model: {GEMINI_MODEL}\n"
-        )
     )
 
 
@@ -482,8 +518,9 @@ app = web.Application()
 
 app.add_routes(
     [
-        web.get("/", home),
+        web.get("/", health),
         web.get("/health", health),
+        web.get("/status", status),
     ]
 )
 
@@ -508,272 +545,293 @@ async def start_web_server():
     )
 
 
-# =========================================================
-# FILE MEMORY
-# =========================================================
-
-def save_memory(
-    file_path,
-    title,
-    content,
-    analysis
-):
-
-    try:
-
-        with file_path.open(
-            "a",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(
-                f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n"
-            )
-
-            f.write(
-                f"{title}\n"
-            )
-
-            f.write(
-                f"INPUT:\n{content}\n\n"
-            )
-
-            f.write(
-                f"ANALYSIS:\n{analysis}\n"
-            )
-
-            f.write(
-                "\n" + "=" * 70 + "\n"
-            )
-
-    except Exception as error:
-
-        logger.error(
-            "Could not save memory: %s",
-            error
-        )
-
-
-# =========================================================
+# ============================================================
 # START COMMAND
-# =========================================================
+# ============================================================
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(
+    message: types.Message
+):
 
     text = (
-        "👑 **مرحبًا بك في Trading Bot**\n\n"
+        "👑 مرحبًا بك في Trading Bot\n\n"
 
-        "📊 **التحليل الحالي:**\n"
-        "النظام جاهز لاستقبال الأخبار والرسائل وتحليلها بواسطة Gemini.\n\n"
+        "📈 أوامر التحليل:\n"
+        "/gold - الذهب XAU/USD\n"
+        "/btc - البيتكوين BTC/USD\n"
+        "/eurusd - EUR/USD\n"
+        "/silver - الفضة XAG/USD\n"
+        "/oil - النفط WTI\n"
+        "/eth - Ethereum ETH/USD\n\n"
 
-        "📰 **الأخبار:**\n"
-        "قم بعمل Forward لأي خبر من قناة Telegram إلى البوت.\n\n"
+        "🧪 أوامر الاختبار:\n"
+        "/auto_backtest\n"
+        "/weekly_table\n\n"
 
-        "🧠 **الاستراتيجيات:**\n"
-        "أرسل نص استراتيجية أو رابطًا لها وسيقوم البوت بتحليلها.\n\n"
+        "📰 الأخبار والاستراتيجيات:\n"
+        "يمكنك إرسال خبر أو إعادة توجيه رسالة من Telegram.\n"
+        "ويمكنك إرسال رابط استراتيجية ليتم تحليله.\n\n"
 
-        "🤖 **Gemini:**\n"
-        f"الموديل الأساسي: `{GEMINI_MODEL}`\n"
-        f"عدد المفاتيح المتاحة: `{len(GEMINI_KEYS)}`\n\n"
-
-        "🔧 **الأوامر:**\n"
-        "/status - حالة البوت\n"
-        "/test_ai - اختبار Gemini\n"
-        "/help - المساعدة\n\n"
-
-        "⚠️ نظام التداول الحقيقي وBacktest الحقيقي "
-        "سيتم ربطهما ببيانات السوق الفعلية، وليس بأرقام عشوائية."
+        "ℹ️ ملاحظة:\n"
+        "التحليل لا يعتبر ضمانًا للربح، ويجب التحقق من بيانات السوق الحية قبل التداول."
     )
 
-    await message.answer(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# =========================================================
-# HELP
-# =========================================================
-
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-
-    await message.answer(
-        "📚 **طريقة الاستخدام**\n\n"
-
-        "1️⃣ **خبر من Telegram**\n"
-        "اعمل Forward للخبر إلى البوت.\n\n"
-
-        "2️⃣ **استراتيجية**\n"
-        "أرسل نص الاستراتيجية أو رابطها.\n\n"
-
-        "3️⃣ **اختبار Gemini**\n"
-        "استخدم `/test_ai`.\n\n"
-
-        "4️⃣ **حالة النظام**\n"
-        "استخدم `/status`.",
-        parse_mode="Markdown"
+    await safe_answer(
+        message,
+        text
     )
 
 
-# =========================================================
+# ============================================================
 # STATUS COMMAND
-# =========================================================
+# ============================================================
 
 @dp.message(Command("status"))
-async def cmd_status(message: types.Message):
-
-    available = 0
-
-    now = time.time()
-
-    for index in range(
-        len(GEMINI_KEYS)
-    ):
-
-        cooldown_until = (
-            key_manager.cooldowns.get(
-                index,
-                0
-            )
-        )
-
-        if cooldown_until <= now:
-            available += 1
-
-    status = (
-        "🟢 ONLINE"
-        if bot
-        else
-        "🔴 BOT_TOKEN MISSING"
-    )
+async def cmd_status(
+    message: types.Message
+):
 
     text = (
-        "📡 **Trading Bot Status**\n\n"
-
-        f"Bot: `{status}`\n"
-        f"Gemini keys configured: `{len(GEMINI_KEYS)}`\n"
-        f"Gemini keys available now: `{available}`\n"
-        f"Primary model: `{GEMINI_MODEL}`\n"
-        f"Fallback models: `{len(MODEL_FALLBACKS)}`\n"
-        f"UTC time: `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}`"
+        "🟢 حالة Trading Bot\n\n"
+        f"Telegram: Online\n"
+        f"Gemini keys: {len(GEMINI_KEYS)}\n"
+        f"Gemini model: {GEMINI_MODEL}\n"
+        f"Server port: {PORT}\n"
+        f"Time UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
-    await message.answer(
-        text,
-        parse_mode="Markdown"
-    )
-
-
-# =========================================================
-# TEST GEMINI
-# =========================================================
-
-@dp.message(Command("test_ai"))
-async def cmd_test_ai(message: types.Message):
-
-    await message.answer(
-        "🧠 جاري اختبار اتصال Gemini..."
-    )
-
-    result = await safe_ai_generate(
-        (
-            "أجب بالعربية باختصار شديد. "
-            "قل إن اتصال Gemini يعمل بنجاح، "
-            "ولا تضف أي معلومات أخرى."
-        ),
-        fallback_text=(
-            "❌ فشل اختبار Gemini."
-        )
-    )
-
-    await message.answer(
-        "🧪 **نتيجة الاختبار:**\n\n"
-        + result,
-        parse_mode="Markdown"
+    await safe_answer(
+        message,
+        text
     )
 
 
-# =========================================================
-# MARKET COMMANDS
-# =========================================================
+# ============================================================
+# MARKET COMMAND
+# ============================================================
 
-async def market_not_ready(
+MARKETS = {
+    "gold": "الذهب XAU/USD",
+    "btc": "Bitcoin BTC/USD",
+    "eurusd": "EUR/USD",
+    "silver": "Silver XAG/USD",
+    "oil": "WTI Crude Oil",
+    "eth": "Ethereum ETH/USD"
+}
+
+
+async def process_market_command(
     message: types.Message,
     asset_name: str
 ):
 
-    await message.answer(
-        f"📊 **{asset_name}**\n\n"
-        "⚠️ محرك بيانات السوق المباشرة لم يتم ربطه "
-        "بهذا الإصدار بعد.\n\n"
-        "لن أعطيك سعرًا وهميًا أو صفقة مبنية على "
-        "بيانات عشوائية.\n\n"
-        "الخطوة التالية هي ربط مصدر OHLCV حقيقي "
-        "ثم بناء التحليل الفني وTrade Manager."
+    command_text = message.text or ""
+
+    parts = command_text.split(
+        maxsplit=1
+    )
+
+    if len(parts) < 2:
+
+        await safe_answer(
+            message,
+            (
+                f"⚠️ لم يتم إدخال سعر.\n\n"
+                f"الأمر الحالي: {parts[0]}\n"
+                f"مثال: {parts[0]} 3500"
+            )
+        )
+
+        return
+
+    raw_price = parts[1].strip()
+
+    try:
+
+        price = float(
+            raw_price.replace(",", "")
+        )
+
+    except ValueError:
+
+        await safe_answer(
+            message,
+            (
+                "⚠️ السعر غير صالح.\n"
+                "أدخل رقمًا فقط، مثال:\n"
+                f"{parts[0]} 3500"
+            )
+        )
+
+        return
+
+    await safe_answer(
+        message,
+        (
+            f"🔄 جاري تحليل {asset_name}...\n"
+            f"السعر المدخل: {price}"
+        )
+    )
+
+    prompt = f"""
+أنت محلل تداول محترف.
+
+حلل الأصل التالي:
+
+الأصل:
+{asset_name}
+
+السعر الحالي الذي أدخله المستخدم:
+{price}
+
+أعطني تحليلًا منظمًا باللغة العربية.
+
+يجب أن يتضمن:
+
+1. الاتجاه:
+BUY أو SELL أو WAIT
+
+2. سبب القرار.
+
+3. منطقة الدخول.
+
+4. Stop Loss.
+
+5. من 3 إلى 10 مستويات Take Profit منطقية.
+
+6. مستوى إلغاء السيناريو.
+
+7. مدة متوقعة للصفقة.
+
+8. درجة قوة السيناريو من 0 إلى 100.
+
+9. أهم المخاطر.
+
+مهم:
+لا تخترع بيانات سوق حية غير موجودة في الطلب.
+السعر المذكور هو السعر الذي أدخله المستخدم وليس مصدرًا مباشرًا للسوق.
+إذا كانت البيانات غير كافية، قل WAIT بدل اختراع معلومات.
+
+لا تستخدم تنسيق HTML.
+يمكنك استخدام نص عادي.
+"""
+
+    analysis = await gemini_generate(
+        prompt
+    )
+
+    report = (
+        f"📊 تحليل {asset_name}\n\n"
+        f"السعر المدخل: {price}\n"
+        f"وقت التحليل UTC: "
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"{analysis}"
+    )
+
+    await safe_answer(
+        message,
+        report
     )
 
 
-@dp.message(Command("gold"))
-async def c_gold(message: types.Message):
+# ============================================================
+# MARKET COMMANDS
+# ============================================================
 
-    await market_not_ready(
+@dp.message(Command("gold"))
+async def cmd_gold(message: types.Message):
+    await process_market_command(
         message,
-        "الذهب XAU/USD"
+        MARKETS["gold"]
     )
 
 
 @dp.message(Command("btc"))
-async def c_btc(message: types.Message):
-
-    await market_not_ready(
+async def cmd_btc(message: types.Message):
+    await process_market_command(
         message,
-        "Bitcoin BTC/USD"
+        MARKETS["btc"]
     )
 
 
 @dp.message(Command("eurusd"))
-async def c_eurusd(message: types.Message):
-
-    await market_not_ready(
+async def cmd_eurusd(message: types.Message):
+    await process_market_command(
         message,
-        "EUR/USD"
+        MARKETS["eurusd"]
     )
 
 
 @dp.message(Command("silver"))
-async def c_silver(message: types.Message):
-
-    await market_not_ready(
+async def cmd_silver(message: types.Message):
+    await process_market_command(
         message,
-        "Silver XAG/USD"
+        MARKETS["silver"]
     )
 
 
 @dp.message(Command("oil"))
-async def c_oil(message: types.Message):
-
-    await market_not_ready(
+async def cmd_oil(message: types.Message):
+    await process_market_command(
         message,
-        "WTI Oil"
+        MARKETS["oil"]
     )
 
 
 @dp.message(Command("eth"))
-async def c_eth(message: types.Message):
-
-    await market_not_ready(
+async def cmd_eth(message: types.Message):
+    await process_market_command(
         message,
-        "Ethereum ETH/USD"
+        MARKETS["eth"]
     )
 
 
-# =========================================================
-# FORWARD DETECTION
-# =========================================================
+# ============================================================
+# BACKTEST
+# ============================================================
 
-def get_forward_info(message: types.Message):
+@dp.message(Command("auto_backtest"))
+async def cmd_auto_backtest(
+    message: types.Message
+):
+
+    await safe_answer(
+        message,
+        (
+            "⚠️ نظام الـ Backtest الحقيقي لم يتم ربطه "
+            "بمصدر بيانات تاريخية في هذه النسخة.\n\n"
+            "لن أعرض أرقامًا عشوائية وأقول إنها نتائج 50 صفقة حقيقية.\n\n"
+            "عندما يتم ربط مصدر OHLCV تاريخي، يمكن تنفيذ "
+            "Backtest حقيقي وتسجيل كل صفقة ونتيجتها."
+        )
+    )
+
+
+@dp.message(Command("weekly_table"))
+async def cmd_weekly_table(
+    message: types.Message
+):
+
+    await safe_answer(
+        message,
+        (
+            "📊 الجدول الأسبوعي غير مفعل بعد.\n\n"
+            "لن يتم اختيار استراتيجية فائزة اعتمادًا على "
+            "بيانات عشوائية أو نتائج وهمية.\n\n"
+            "يجب أولًا توفير بيانات تاريخية حقيقية ثم "
+            "اختبار الاستراتيجيات عليها."
+        )
+    )
+
+
+# ============================================================
+# FORWARDED NEWS / STRATEGY
+# ============================================================
+
+def get_forward_info(
+    message: types.Message
+):
 
     origin = getattr(
         message,
@@ -781,460 +839,365 @@ def get_forward_info(message: types.Message):
         None
     )
 
-    if not origin:
+    if origin is None:
         return None
 
     info = {
-        "source": "Unknown",
-        "date": None,
-        "message_id": None
-    }
-
-    try:
-
-        origin_type = getattr(
-            origin,
-            "type",
-            ""
-        )
-
-        if origin_type == "channel":
-
-            chat = getattr(
-                origin,
-                "chat",
-                None
-            )
-
-            if chat:
-
-                info["source"] = (
-                    getattr(
-                        chat,
-                        "title",
-                        None
-                    )
-                    or
-                    getattr(
-                        chat,
-                        "username",
-                        None
-                    )
-                    or
-                    "Telegram Channel"
-                )
-
-            info["message_id"] = getattr(
-                origin,
-                "message_id",
-                None
-            )
-
-        elif origin_type == "user":
-
-            sender_user = getattr(
-                origin,
-                "sender_user",
-                None
-            )
-
-            if sender_user:
-
-                first_name = getattr(
-                    sender_user,
-                    "first_name",
-                    ""
-                )
-
-                last_name = getattr(
-                    sender_user,
-                    "last_name",
-                    ""
-                )
-
-                info["source"] = (
-                    f"{first_name} {last_name}"
-                ).strip() or "Telegram User"
-
-        elif origin_type == "hidden_user":
-
-            info["source"] = getattr(
-                origin,
-                "sender_user_name",
-                "Hidden Telegram User"
-            )
-
-        info["date"] = getattr(
+        "type": type(origin).__name__,
+        "date": getattr(
             origin,
             "date",
             None
+        ),
+        "chat_title": None,
+        "message_id": None
+    }
+
+    chat = getattr(
+        origin,
+        "chat",
+        None
+    )
+
+    if chat:
+        info["chat_title"] = getattr(
+            chat,
+            "title",
+            None
         )
 
-    except Exception as error:
-
-        logger.warning(
-            "Could not parse forward origin: %s",
-            error
-        )
+    info["message_id"] = getattr(
+        origin,
+        "message_id",
+        None
+    )
 
     return info
 
 
-# =========================================================
-# NEWS ANALYSIS
-# =========================================================
-
-async def analyze_news(
-    message: types.Message,
-    text: str,
-    forward_info
-):
-
-    source = (
-        forward_info["source"]
-        if forward_info
-        else
-        "Telegram"
-    )
-
-    date = (
-        forward_info["date"]
-        if forward_info
-        else
-        datetime.now(timezone.utc)
-    )
-
-    prompt = f"""
-أنت محلل أخبار اقتصادي محترف متخصص في أسواق الفوركس
-والذهب والعملات الرقمية والنفط.
-
-وصل خبر من Telegram.
-
-المصدر:
-{source}
-
-وقت الخبر:
-{date}
-
-نص الخبر:
-{text}
-
-حلل الخبر بدون اختلاق أي معلومات غير موجودة.
-
-أعطني التقرير بهذا الترتيب:
-
-1. 📰 ملخص الخبر
-2. 🎯 الأصول التي قد تتأثر
-3. 📈 الاتجاه المحتمل لكل أصل:
-   BUY / SELL / NEUTRAL
-4. ⚡ قوة التأثير:
-   LOW / MEDIUM / HIGH / EXTREME
-5. ⏱️ مدة التأثير المحتملة:
-   دقائق / ساعات / يوم / عدة أيام
-6. 📊 لماذا قد يتأثر السوق؟
-7. ⚠️ المخاطر وما الذي قد يبطل التأثير
-8. 🔎 ما البيانات التي يجب مراقبتها بعد الخبر؟
-9. 🚫 لا تعطِ صفقة مباشرة إذا لم توجد معلومات كافية.
-
-مهم:
-لا تدّعِ أنك تملك سعرًا لحظيًا إذا لم يتم تزويدك به.
-لا تخترع أرقامًا أو أسعارًا.
-"""
-
-    analysis = await safe_ai_generate(
-        prompt,
-        fallback_text=(
-            "❌ تعذر تحليل الخبر حاليًا، "
-            "لكن تم حفظه في ذاكرة البوت."
-        )
-    )
-
-    save_memory(
-        NEWS_FILE,
-        f"NEWS FROM: {source}",
-        text,
-        analysis
-    )
-
-    return analysis
-
-
-# =========================================================
-# STRATEGY ANALYSIS
-# =========================================================
-
-async def analyze_strategy(
-    text: str
-):
-
-    prompt = f"""
-أنت مهندس استراتيجيات تداول وباحث Quant.
-
-حلل الاستراتيجية التالية:
-
-{text}
-
-أريد استخراجها بطريقة قابلة للتحويل لاحقًا إلى Backtest حقيقي.
-
-اكتب:
-
-1. اسم الاستراتيجية
-2. السوق المناسب
-3. Timeframe
-4. شروط BUY بالتحديد
-5. شروط SELL بالتحديد
-6. شروط الدخول
-7. Stop Loss
-8. Take Profit
-9. إدارة الصفقة
-10. شروط الخروج
-11. المؤشرات المطلوبة
-12. الحالات التي تمنع الدخول
-13. هل يمكن تحويلها إلى قواعد برمجية واضحة؟
-14. ما المعلومات الناقصة؟
-15. كيف يجب اختبارها تاريخيًا؟
-
-مهم جدًا:
-لا تدّعي أن الاستراتيجية رابحة.
-لا تخترع نتائج Backtest.
-لا تقل إنها حققت نسبة نجاح معينة بدون بيانات تاريخية فعلية.
-"""
-
-    analysis = await safe_ai_generate(
-        prompt,
-        fallback_text=(
-            "❌ تعذر تحليل الاستراتيجية حاليًا."
-        )
-    )
-
-    save_memory(
-        STRATEGY_FILE,
-        "STRATEGY",
-        text,
-        analysis
-    )
-
-    return analysis
-
-
-# =========================================================
-# GENERAL TEXT / FORWARDED NEWS / STRATEGIES
-# =========================================================
-
-@dp.message()
-async def handle_all_messages(
+def extract_message_text(
     message: types.Message
 ):
 
-    # Ignore commands not caught above.
-    if message.text and message.text.startswith("/"):
+    text = message.text
+
+    if not text:
+        text = message.caption
+
+    if not text:
+        return ""
+
+    return str(text).strip()
+
+
+def looks_like_strategy(
+    text: str
+):
+
+    lowered = text.lower()
+
+    keywords = [
+        "strategy",
+        "trading strategy",
+        "استراتيجية",
+        "استراتيجيه",
+        "tradingview",
+        "forex strategy",
+        "scalping",
+        "swing trading"
+    ]
+
+    if "http://" in lowered:
+        return True
+
+    if "https://" in lowered:
+        return True
+
+    return any(
+        keyword in lowered
+        for keyword in keywords
+    )
+
+
+@dp.message(
+    F.text
+)
+async def handle_text(
+    message: types.Message
+):
+
+    text = extract_message_text(
+        message
+    )
+
+    if not text:
         return
 
-    text = (
-        message.text
-        or
-        message.caption
-        or
-        ""
-    ).strip()
-
-    # -----------------------------------------------------
-    # FORWARDED MESSAGE
-    # -----------------------------------------------------
+    # Ignore commands.
+    if text.startswith("/"):
+        return
 
     forward_info = get_forward_info(
         message
     )
 
+    is_forwarded = (
+        forward_info is not None
+    )
+
+    strategy = looks_like_strategy(
+        text
+    )
+
+    if strategy:
+        target = "استراتيجية تداول"
+    elif is_forwarded:
+        target = "خبر أو رسالة معاد توجيهها"
+    else:
+        target = "خبر اقتصادي أو رسالة تداول"
+
+    await safe_answer(
+        message,
+        (
+            f"🧠 جاري تحليل {target}...\n"
+            "يرجى الانتظار."
+        )
+    )
+
+    forward_context = ""
+
     if forward_info:
 
-        if not text:
+        forward_context = (
+            "\n\nمعلومات إعادة التوجيه:\n"
+            f"النوع: {forward_info.get('type')}\n"
+            f"القناة: {forward_info.get('chat_title')}\n"
+            f"Message ID: {forward_info.get('message_id')}\n"
+        )
 
-            await message.answer(
-                "⚠️ استلمت الرسالة المُعاد توجيهها، "
-                "لكن لا يوجد نص أو Caption يمكن تحليله في هذا الإصدار."
+    prompt = f"""
+أنت محلل أسواق مالية.
+
+حلل المحتوى التالي:
+
+{target}
+
+المحتوى:
+{text}
+
+{forward_context}
+
+أجب بالعربية.
+
+استخرج:
+
+1. ملخص المحتوى.
+2. الأصل أو الأصول المتأثرة.
+3. هل التأثير إيجابي أم سلبي أم محايد؟
+4. قوة التأثير من 0 إلى 100.
+5. المدة المتوقعة للتأثير.
+6. هل يمكن أن يؤثر على الذهب؟
+7. هل يمكن أن يؤثر على الدولار؟
+8. هل يمكن أن يؤثر على EUR/USD؟
+9. هل يمكن أن يؤثر على النفط؟
+10. هل يمكن أن يؤثر على Bitcoin؟
+11. ما الإجراء التداولي المنطقي؟
+12. إذا كانت المعلومات غير كافية، قل بوضوح: غير كافٍ لاتخاذ قرار.
+
+ممنوع اختراع أسعار أو أخبار غير موجودة في النص.
+
+استخدم نصًا عاديًا.
+لا تعتمد على Markdown أو HTML.
+"""
+
+    analysis = await gemini_generate(
+        prompt
+    )
+
+    if strategy:
+
+        save_memory(
+            STRATEGY_FILE,
+            "STRATEGY",
+            (
+                f"INPUT:\n{text}\n\n"
+                f"ANALYSIS:\n{analysis}"
             )
-
-            return
-
-        source = forward_info["source"]
-
-        await message.answer(
-            f"📰 تم استلام خبر مُعاد توجيهه من:\n"
-            f"**{source}**\n\n"
-            f"🧠 جاري التحليل...",
-            parse_mode="Markdown"
         )
 
-        analysis = await analyze_news(
-            message,
-            text,
-            forward_info
+    else:
+
+        save_memory(
+            NEWS_FILE,
+            "NEWS",
+            (
+                f"INPUT:\n{text}\n\n"
+                f"ANALYSIS:\n{analysis}"
+            )
         )
 
-        await message.answer(
-            "📊 **تحليل الخبر:**\n\n"
-            + analysis,
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # EMPTY MESSAGE
-    # -----------------------------------------------------
-
-    if not text:
-
-        await message.answer(
-            "⚠️ أرسل نصًا أو Caption أو قم بعمل Forward لخبر."
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # DETECT STRATEGY / URL
-    # -----------------------------------------------------
-
-    lower_text = text.lower()
-
-    is_url = (
-        "http://" in lower_text
-        or
-        "https://" in lower_text
-        or
-        "www." in lower_text
+    result = (
+        f"✅ تحليل {target}\n\n"
+        f"{analysis}"
     )
 
-    strategy_keywords = [
-        "استراتيجية",
-        "استراتيجيه",
-        "strategy",
-        "trading strategy",
-        "tradingview",
-        "pine script",
-        "backtest",
-        "مؤشر",
-        "indicator",
-        "buy signal",
-        "sell signal"
-    ]
-
-    is_strategy = (
-        is_url
-        or
-        any(
-            keyword in lower_text
-            for keyword in strategy_keywords
-        )
-    )
-
-    # -----------------------------------------------------
-    # STRATEGY
-    # -----------------------------------------------------
-
-    if is_strategy:
-
-        await message.answer(
-            "🧠 تم التعرف على محتوى متعلق باستراتيجية.\n"
-            "جاري استخراج قواعدها..."
-        )
-
-        analysis = await analyze_strategy(
-            text
-        )
-
-        await message.answer(
-            "🧪 **تحليل الاستراتيجية:**\n\n"
-            + analysis,
-            parse_mode="Markdown"
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # GENERAL TEXT = NEWS
-    # -----------------------------------------------------
-
-    await message.answer(
-        "📰 تم استلام النص.\n"
-        "جاري تحليله كخبر/معلومة سوقية..."
-    )
-
-    analysis = await analyze_news(
+    await safe_answer(
         message,
-        text,
-        None
-    )
-
-    await message.answer(
-        "📊 **تحليل المحتوى:**\n\n"
-        + analysis,
-        parse_mode="Markdown"
+        result
     )
 
 
-# =========================================================
-# GLOBAL ERROR HANDLER
-# =========================================================
+# ============================================================
+# PHOTO / CAPTION
+# ============================================================
 
-async def global_error_handler(
-    event,
-    exception
+@dp.message(
+    F.photo
+)
+async def handle_photo(
+    message: types.Message
 ):
 
-    logger.exception(
-        "Unhandled Telegram error: %s",
-        exception
-    )
+    caption = (
+        message.caption
+        or ""
+    ).strip()
 
-    save_error(exception)
+    if not caption:
 
-
-# =========================================================
-# STARTUP
-# =========================================================
-
-async def main():
-
-    if not BOT_TOKEN:
-
-        logger.error(
-            "BOT_TOKEN is missing. "
-            "Set BOT_TOKEN in Render Environment Variables."
+        await safe_answer(
+            message,
+            (
+                "🖼️ تم استلام صورة.\n\n"
+                "في هذه النسخة لم يتم تفعيل تحليل "
+                "صور Telegram بواسطة Gemini."
+            )
         )
 
         return
 
-    if not GEMINI_KEYS:
+    await safe_answer(
+        message,
+        "🧠 جاري تحليل النص المرفق بالصورة..."
+    )
 
-        logger.warning(
-            "No GEMINI_API_KEYS found. "
-            "Bot will start but AI analysis will fail."
-        )
+    prompt = f"""
+حلل هذا النص المرتبط بصورة تداولية:
 
-    await start_web_server()
+{caption}
+
+أعطني:
+- الأصل المحتمل
+- الاتجاه المحتمل
+- أهم المستويات المذكورة
+- المخاطر
+- هل توجد معلومات كافية لاتخاذ قرار؟
+
+لا تخترع بيانات غير موجودة.
+"""
+
+    analysis = await gemini_generate(
+        prompt
+    )
+
+    await safe_answer(
+        message,
+        "📊 تحليل الصورة والنص:\n\n" + analysis
+    )
+
+
+# ============================================================
+# UNKNOWN COMMAND HANDLER
+# ============================================================
+
+@dp.message(
+    F.text.startswith("/")
+)
+async def unknown_command(
+    message: types.Message
+):
+
+    text = (
+        "⚠️ الأمر غير معروف.\n\n"
+        "استخدم /start لرؤية الأوامر المتاحة."
+    )
+
+    await safe_answer(
+        message,
+        text
+    )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+async def startup():
 
     logger.info(
-        "=============================================="
+        "Starting Trading Bot..."
     )
 
     logger.info(
-        "Trading Bot starting..."
-    )
-
-    logger.info(
-        "Gemini keys: %s",
-        len(GEMINI_KEYS)
-    )
-
-    logger.info(
-        "Primary model: %s",
+        "Gemini model: %s",
         GEMINI_MODEL
     )
 
     logger.info(
-        "=============================================="
+        "Gemini keys configured: %s",
+        len(GEMINI_KEYS)
+    )
+
+    # Remove an old webhook if one exists.
+    # This is necessary because polling and webhook mode
+    # must not be active simultaneously.
+    try:
+
+        await bot.delete_webhook(
+            drop_pending_updates=False
+        )
+
+        logger.info(
+            "Telegram webhook cleared."
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Could not clear Telegram webhook: %s",
+            exc
+        )
+
+    await start_web_server()
+
+    try:
+
+        bot_info = await bot.get_me()
+
+        logger.info(
+            "Bot connected: @%s id=%s",
+            bot_info.username,
+            bot_info.id
+        )
+
+    except Exception as exc:
+
+        logger.error(
+            "Could not connect to Telegram: %s",
+            exc
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+
+    await startup()
+
+    logger.info(
+        "Starting Telegram polling..."
     )
 
     try:
@@ -1244,36 +1207,49 @@ async def main():
             allowed_updates=dp.resolve_used_update_types()
         )
 
-    finally:
+    except asyncio.CancelledError:
 
-        if bot:
-
-            await bot.session.close()
-
-
-# =========================================================
-# ENTRY POINT
-# =========================================================
-
-if __name__ == "__main__":
-
-    try:
-
-        asyncio.run(
-            main()
+        logger.warning(
+            "Polling cancelled."
         )
 
-    except KeyboardInterrupt:
+    except Exception as exc:
+
+        logger.exception(
+            "Polling stopped because of an error: %s",
+            exc
+        )
+
+        raise
+
+    finally:
+
+        await bot.session.close()
 
         logger.info(
             "Trading Bot stopped."
         )
 
-    except Exception as error:
 
-        logger.exception(
-            "Fatal application error: %s",
-            error
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Bot stopped manually."
         )
 
-        save_error(error)
+    except Exception as exc:
+
+        logger.exception(
+            "Fatal error: %s",
+            exc
+    )
