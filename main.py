@@ -61,6 +61,13 @@ MIN_CONFIDENCE_TO_OPEN = float(os.getenv("MIN_CONFIDENCE_TO_OPEN", "62"))
 MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "30"))
 PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "8"))
 MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "30"))
+# Market-close protection: trades are never allowed to outlive the next
+# configured market close. Times are UTC. Crypto is 24/7 and has no close.
+MARKET_CLOSE_PROTECTION = os.getenv("MARKET_CLOSE_PROTECTION", "true").lower() in ("1", "true", "yes", "on")
+FOREX_CLOSE_UTC = os.getenv("FOREX_CLOSE_UTC", "22:00")
+METALS_CLOSE_UTC = os.getenv("METALS_CLOSE_UTC", "22:00")
+OIL_CLOSE_UTC = os.getenv("OIL_CLOSE_UTC", "22:00")
+MARKET_CLOSE_BUFFER_MINUTES = int(os.getenv("MARKET_CLOSE_BUFFER_MINUTES", "5"))
 STATE_FILE = os.getenv("STATE_FILE", "trading_state.json")
 STRATEGY_DB_FILE = os.getenv("STRATEGY_DB_FILE", "strategies_db.json")
 TRAINING_TESTS = max(70, int(os.getenv("TRAINING_TESTS", "70")))
@@ -519,6 +526,7 @@ class Trade:
     opened_at: str
     estimated_duration_minutes: int
     next_reanalysis_at: str
+    market_close_at: str = ""
     status: str = "OPEN"
     last_price: float = 0.0
     last_action: str = "OPENED"
@@ -563,15 +571,58 @@ def load_state():
             raw.setdefault("management", raw.get("last_action", "OPEN"))
             raw.setdefault("score", 0)
             raw.setdefault("confidence", 0.0)
+            raw.setdefault("market_close_at", "")
             open_trades[tid] = Trade(**raw)
         logger.info("Loaded %s trades from state", len(open_trades))
     except Exception:
         logger.exception("Could not load state")
 
 
+def _parse_hhmm(value: str) -> Tuple[int, int]:
+    try:
+        h, m = value.strip().split(":", 1)
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h, m
+    except Exception:
+        pass
+    return 22, 0
+
+def next_market_close(asset_key: str, now: Optional[datetime] = None) -> Optional[datetime]:
+    """Return the next close time for the asset in local timezone.
+
+    Crypto is 24/7, so it returns None. For FX/metals the default is the
+    weekly Friday close. Oil is also treated as a weekly-close instrument
+    here; the exact venue schedule can be changed with OIL_CLOSE_UTC.
+    """
+    if not MARKET_CLOSE_PROTECTION or asset_key in ("btc", "eth"):
+        return None
+    now = now or now_local()
+    close_text = METALS_CLOSE_UTC if asset_key in ("gold", "silver") else OIL_CLOSE_UTC if asset_key == "oil" else FOREX_CLOSE_UTC
+    hour, minute = _parse_hhmm(close_text)
+    utc_now = now.astimezone(timezone.utc)
+    days_until_friday = (4 - utc_now.weekday()) % 7
+    candidate = (utc_now + timedelta(days=days_until_friday)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= utc_now:
+        candidate += timedelta(days=7)
+    return candidate.astimezone(LOCAL_TZ)
+
+def calculate_trade_expiry(trade_opened_at: datetime, duration_minutes: int, asset_key: str) -> Tuple[datetime, str]:
+    normal_expiry = trade_opened_at + timedelta(minutes=max(1, duration_minutes))
+    close = next_market_close(asset_key, trade_opened_at)
+    if close is not None:
+        protected_close = close - timedelta(minutes=max(0, MARKET_CLOSE_BUFFER_MINUTES))
+        if protected_close <= trade_opened_at:
+            return protected_close, "MARKET CLOSE"
+        if protected_close < normal_expiry:
+            return protected_close, "MARKET CLOSE"
+    return normal_expiry, "TIME LIMIT"
+
 def create_trade(chat_id: int, analysis: Analysis) -> Trade:
     now = now_local()
     mins = max(1, round(analysis.duration_minutes * REANALYSIS_PERCENT))
+    expiry, _reason = calculate_trade_expiry(now, analysis.duration_minutes, analysis.asset_key)
+    market_close = next_market_close(analysis.asset_key, now)
     return Trade(
         id=uuid.uuid4().hex[:8].upper(), chat_id=chat_id,
         asset_key=analysis.asset_key, asset_name=analysis.asset_name, symbol=analysis.symbol,
@@ -579,6 +630,7 @@ def create_trade(chat_id: int, analysis: Analysis) -> Trade:
         entry_price=analysis.price, sl=analysis.sl, tps=analysis.tps,
         opened_at=now.isoformat(), estimated_duration_minutes=analysis.duration_minutes,
         next_reanalysis_at=(now + timedelta(minutes=mins)).isoformat(),
+        market_close_at=market_close.isoformat() if market_close else "",
         last_price=analysis.price, score=analysis.score, confidence=analysis.confidence,
     )
 
@@ -594,6 +646,7 @@ def trade_status_text(trade: Trade) -> str:
         f"Management: {trade.management}\n"
         f"Reached TP: {reached}\n"
         f"Next reanalysis: {next_time}\n"
+        f"Market close: {(dt_from_string(trade.market_close_at).strftime('%Y-%m-%d %H:%M:%S') if trade.market_close_at else '24/7 / no close')}\n"
         f"Last action: {trade.last_action}"
     )
 
@@ -601,8 +654,12 @@ def trade_expired(trade: Trade, now: Optional[datetime] = None) -> bool:
     if trade.status != "OPEN":
         return False
     now = now or now_local()
-    expiry = dt_from_string(trade.opened_at) + timedelta(minutes=trade.estimated_duration_minutes)
-    return now >= expiry
+    opened = dt_from_string(trade.opened_at)
+    expiry, reason = calculate_trade_expiry(opened, trade.estimated_duration_minutes, trade.asset_key)
+    if now >= expiry:
+        trade.last_action = f"EXPIRED - {reason}"
+        return True
+    return False
 
 
 def evaluate_trade_price(trade: Trade, price: float) -> List[str]:
@@ -635,7 +692,8 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
     if trade_expired(trade, now):
         trade.status = "EXPIRED"
         trade.management = "CLOSE"
-        trade.last_action = "EXPIRED - TIME LIMIT"
+        if not trade.last_action.startswith("EXPIRED -"):
+            trade.last_action = "EXPIRED - TIME LIMIT"
         trade.last_review_at = now.isoformat()
         save_state()
         # Analysis is only needed by callers that expect it; fetch one current snapshot.
@@ -668,6 +726,8 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
         trade.hit_tps = []
         trade.notified_tps = []
         trade.estimated_duration_minutes = max(1, analysis.duration_minutes)
+        close_at = next_market_close(trade.asset_key, now)
+        trade.market_close_at = close_at.isoformat() if close_at else ""
 
     trade.last_price = analysis.price
     trade.score = analysis.score
@@ -727,6 +787,7 @@ async def cmd_start(message: types.Message):
         "🧪 الاختبار والتعلم:\n/auto_backtest\n/weekly_table\n/strategies\n/strategy STRATEGY_ID\n/training\n/retrain STRATEGY_ID\n\n"
         "🎥 أرسل رابط فيديو للاستراتيجية؛ سيُستخرج النص المتاح ويُختبر تاريخيًا في منطقة التدريب فقط.\n"
         "📰 أرسل أو أعد توجيه خبر إلى البوت لتحليل تأثيره.\n\n"
+        "⏰ حماية إغلاق السوق مفعلة: الصفقة تنتهي تلقائيًا قبل وقت الإغلاق المحدد للسوق. Crypto يعمل 24/7.\n\n"
         "⚠️ لا يوجد ضمان للربح."
     )
 
@@ -1697,6 +1758,15 @@ async def handle_caption(message: types.Message):
 # ============================================================
 async def monitor_one_trade(trade: Trade):
     try:
+        # Market-close protection is checked before the next price request.
+        # This guarantees a trade cannot remain OPEN after the configured close.
+        if trade_expired(trade):
+            save_state()
+            await safe_reply(trade.chat_id,
+                f"⏰ إغلاق تلقائي بسبب إغلاق السوق\nالأصل: {trade.asset_name}\n"
+                f"Trade ID: {trade.id}\nالحالة: {trade.status}\n"
+                f"الإجراء: {trade.last_action}")
+            return
         # Price-only polling every 30 seconds: protects SL/TP between scheduled reviews.
         price = await get_price(trade.symbol, use_cache=False)
         events = evaluate_trade_price(trade, price)
