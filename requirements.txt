@@ -1,4 +1,4 @@
 aiogram>=3.7,<4
-aiohttp>=3.9
-google-genai>=1.0
-yt-dlp
+aiohttp>=3.9,<4
+google-genai>=1.0,<2
+ yt-dlp>=2025.1.0
