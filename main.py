@@ -739,6 +739,14 @@ class VideoTradeSetup:
     rank_score: float = 0.0
     status: str = "EXTRACTED"
     created_at: str = ""
+    chat_id: int = 0
+    next_reanalysis_at: str = ""
+    last_reanalysis_at: str = ""
+    last_live_price: float = 0.0
+    live_signal: str = ""
+    live_confidence: float = 0.0
+    live_score: int = 0
+    last_reanalysis_note: str = ""
 
 video_trade_setups: Dict[str, VideoTradeSetup] = {}
 video_trade_lock = asyncio.Lock()
@@ -919,6 +927,14 @@ def load_video_trade_setups():
             raw.setdefault("rank_score", 0.0)
             raw.setdefault("status", "EXTRACTED")
             raw.setdefault("created_at", now_local().isoformat())
+            raw.setdefault("chat_id", 0)
+            raw.setdefault("next_reanalysis_at", "")
+            raw.setdefault("last_reanalysis_at", "")
+            raw.setdefault("last_live_price", 0.0)
+            raw.setdefault("live_signal", "")
+            raw.setdefault("live_confidence", 0.0)
+            raw.setdefault("live_score", 0)
+            raw.setdefault("last_reanalysis_note", "")
             try:
                 video_trade_setups[sid] = VideoTradeSetup(**raw)
             except Exception:
@@ -2714,6 +2730,9 @@ async def extract_video_trade_setups(source_url: str, source_text: str) -> List[
         )
         setup.rank_score = _rank_video_trade_setup(setup)
         setup.status = "COMPLETE" if entry > 0 and sl > 0 and tps else "PARTIAL"
+        if setup.duration_minutes > 0:
+            mins = video_trade_reanalysis_minutes(setup)
+            setup.next_reanalysis_at = (now_local() + timedelta(minutes=mins)).isoformat()
         result.append(setup)
     result.sort(key=lambda x: (x.rank_score, x.confidence, x.rr_tp10), reverse=True)
     return result
@@ -2735,6 +2754,99 @@ def video_trade_summary(setups: List[VideoTradeSetup], limit: int = 10) -> str:
             f"   Timestamp {s.source_timestamp or '—'} | {s.status} | ID {s.id}"
         )
     return "\n\n".join(lines)
+
+
+
+def video_trade_reanalysis_minutes(setup: VideoTradeSetup, analysis: Optional[Analysis] = None) -> int:
+    """Return the next review interval = 10% of the setup holding time.
+    If the video did not provide a duration, use the live engine's dynamic
+    estimate when available; otherwise use a conservative 60-minute default.
+    """
+    duration = int(setup.duration_minutes or 0)
+    if duration <= 0 and analysis is not None:
+        duration = int(getattr(analysis, "duration_minutes", 0) or 0)
+    if duration <= 0:
+        duration = 60
+    duration = max(MIN_TRADE_DURATION_MINUTES, min(MAX_TRADE_DURATION_MINUTES, duration))
+    return max(1, round(duration * REANALYSIS_PERCENT))
+
+
+def rank_video_trade_with_live(setup: VideoTradeSetup, analysis: Analysis) -> float:
+    """Blend the video evidence with current market confluence without
+    rewriting the original video setup numbers."""
+    score = float(setup.rank_score) * 0.55
+    if analysis.signal == setup.side:
+        score += 25.0
+    elif analysis.signal == "NO TRADE":
+        score += 4.0
+    else:
+        score -= 15.0
+    score += min(10.0, max(0.0, analysis.confidence) * 0.10)
+    if setup.entry_price > 0:
+        distance = abs(analysis.price - setup.entry_price)
+        if setup.sl > 0 and setup.tps:
+            risk = abs(setup.entry_price - setup.sl)
+            if risk > 0 and distance <= risk * 1.5:
+                score += 6.0
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+async def reanalyze_video_trade_setup(setup: VideoTradeSetup, reason: str = "scheduled") -> VideoTradeSetup:
+    """Re-evaluate a concrete trade extracted from a video every 10% of its
+    duration. This is independent of open paper trades, so a video trade is
+    not silently ignored just because the user did not open it as a paper trade.
+    """
+    now = now_local()
+    analysis, _candles = await get_market_snapshot(setup.asset_key)
+    price = float(analysis.price)
+    setup.last_live_price = price
+    setup.last_reanalysis_at = now.isoformat()
+    setup.live_signal = analysis.signal
+    setup.live_confidence = float(analysis.confidence)
+    setup.live_score = int(analysis.score)
+    if setup.duration_minutes <= 0:
+        setup.duration_minutes = max(1, int(analysis.duration_minutes or 60))
+
+    # Determine the current state of the video-provided levels first.
+    if setup.sl > 0 and ((setup.side == "BUY" and price <= setup.sl) or (setup.side == "SELL" and price >= setup.sl)):
+        setup.status = "INVALID - SL LEVEL REACHED"
+        note = "السعر الحالي وصل/تجاوز وقف الخسارة المقدم في الفيديو."
+    elif setup.tps and ((setup.side == "BUY" and price >= setup.tps[-1]) or (setup.side == "SELL" and price <= setup.tps[-1])):
+        setup.status = "TARGET ZONE REACHED"
+        note = "السعر الحالي وصل إلى آخر هدف مقدم في الفيديو."
+    elif analysis.signal == setup.side:
+        setup.status = "VALID - LIVE CONFIRMED"
+        note = "الإشارة الحالية متوافقة مع اتجاه الصفقة المستخرجة من الفيديو."
+    elif analysis.signal == "NO TRADE":
+        setup.status = "WEAK - NO CURRENT SIGNAL"
+        note = "الاتجاه الأصلي محفوظ، لكن المحرك الحالي لا يعطي إشارة جديدة كافية."
+    else:
+        setup.status = "INVALID - DIRECTION CHANGED"
+        note = "المحرك الحالي أعطى اتجاهًا معاكسًا للصفقة المستخرجة."
+    setup.last_reanalysis_note = note
+    setup.rank_score = rank_video_trade_with_live(setup, analysis)
+    mins = video_trade_reanalysis_minutes(setup, analysis)
+    setup.next_reanalysis_at = (now + timedelta(minutes=mins)).isoformat()
+    return setup
+
+
+async def reanalyze_due_video_trades() -> List[VideoTradeSetup]:
+    now = now_local()
+    due = []
+    for setup in list(video_trade_setups.values()):
+        if not setup.next_reanalysis_at or dt_from_string(setup.next_reanalysis_at) <= now:
+            due.append(setup)
+    if not due:
+        return []
+    results = []
+    for setup in sorted(due, key=lambda x: x.rank_score, reverse=True)[:VIDEO_TRADE_MAX]:
+        try:
+            results.append(await reanalyze_video_trade_setup(setup, "scheduled"))
+        except Exception as exc:
+            logger.warning("Video trade scheduled reanalysis failed for %s: %s", setup.id, exc)
+    if results:
+        save_video_trade_setups()
+    return results
 
 
 async def process_strategy_video(message: types.Message, url: str, original_text: str):
@@ -2779,6 +2891,7 @@ async def process_strategy_video(message: types.Message, url: str, original_text
     try:
         async with video_trade_lock:
             for setup in setups:
+                setup.chat_id = int(getattr(message.chat, "id", 0) or 0)
                 video_trade_setups[setup.id] = setup
             if len(video_trade_setups) > VIDEO_TRADE_MAX * 10:
                 ranked = sorted(video_trade_setups.values(), key=lambda x: (x.rank_score, x.created_at), reverse=True)
@@ -2786,7 +2899,18 @@ async def process_strategy_video(message: types.Message, url: str, original_text
                 video_trade_setups.update({x.id: x for x in ranked[:VIDEO_TRADE_MAX * 10]})
             save_video_trade_setups()
         if setups:
+            # Initial live check immediately, then repeat every 10% of the setup duration.
+            for setup in setups:
+                try:
+                    await reanalyze_video_trade_setup(setup, "video-submitted")
+                except Exception as exc:
+                    logger.warning("Initial video trade reanalysis failed for %s: %s", setup.id, exc)
+            save_video_trade_setups()
+            setups.sort(key=lambda x: (x.rank_score, x.confidence), reverse=True)
             await safe_send(message, video_trade_summary(setups))
+            next_times = [dt_from_string(x.next_reanalysis_at).strftime("%H:%M:%S") for x in setups if x.next_reanalysis_at]
+            if next_times:
+                await safe_send(message, f"🔄 تمت إعادة تحليل صفقات الفيديو الآن. المراجعة القادمة تلقائيًا بعد 10% من المدة — أقرب موعد: {min(next_times)}")
         else:
             await safe_send(message, "🎯 لم يستخرج الفيديو صفقة محددة بأرقام موثوقة؛ لن أخترع Entry/SL/TP.")
 
@@ -3041,6 +3165,25 @@ async def trade_monitor():
     while True:
         try:
             await evaluate_news_learning()
+            try:
+                video_updates = await reanalyze_due_video_trades()
+                for setup in video_updates:
+                    if setup.chat_id:
+                        try:
+                            await safe_reply(setup.chat_id,
+                                f"🔄 إعادة تحليل صفقة الفيديو\n"
+                                f"الأصل: {setup.asset_name} | {setup.side}\n"
+                                f"ID: {setup.id}\n"
+                                f"السعر الحي: {format_price(setup.last_live_price)}\n"
+                                f"الحالة: {setup.status}\n"
+                                f"الإشارة الحالية: {setup.live_signal} | الثقة {setup.live_confidence:.0f}% | Score {setup.live_score}\n"
+                                f"Rank الحالي: {setup.rank_score:.2f}/100\n"
+                                f"{setup.last_reanalysis_note}\n"
+                                f"المراجعة القادمة: {dt_from_string(setup.next_reanalysis_at).strftime('%H:%M:%S')}" )
+                        except Exception:
+                            logger.exception("Could not notify video trade %s", setup.id)
+            except Exception:
+                logger.exception("Video trade monitor error")
             trades=[t for t in list(open_trades.values()) if t.status=="OPEN"]
             # First: lightweight live price monitoring for every open trade.
             await asyncio.gather(*(monitor_one_trade(t) for t in trades), return_exceptions=True)
