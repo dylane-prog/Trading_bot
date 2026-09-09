@@ -36,7 +36,12 @@ except Exception:
 # CONFIGURATION
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+def get_twelve_data_api_key() -> str:
+    """Read the Twelve Data key at runtime so Render environment changes are not
+    hidden behind a stale module-level value. Never log or expose the key.
+    """
+    return os.getenv("TWELVE_DATA_API_KEY", "").strip()
+
 
 raw_keys = os.getenv("GEMINI_API_KEYS", "").strip()
 if raw_keys:
@@ -218,10 +223,14 @@ market_lock = asyncio.Lock()
 price_lock = asyncio.Lock()
 
 async def td_get(path: str, params: dict) -> dict:
-    if not TWELVE_DATA_API_KEY:
-        raise RuntimeError("TWELVE_DATA_API_KEY is not configured in Render Environment Variables.")
+    api_key = get_twelve_data_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "TWELVE_DATA_API_KEY is not available to the running Render service. "
+            "Check Environment Variables and redeploy/restart the service."
+        )
     params = dict(params)
-    params["apikey"] = TWELVE_DATA_API_KEY
+    params["apikey"] = api_key
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get("https://api.twelvedata.com/" + path, params=params) as response:
@@ -874,9 +883,6 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
 # ASSET COMMANDS
 # ============================================================
 async def perform_asset_analysis(message: types.Message, asset_key: str, create_new_trade: bool = True):
-    if not TWELVE_DATA_API_KEY:
-        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير موجود في Render Environment.")
-        return
     cfg = ASSETS[asset_key]
     await safe_send(message, f"🔄 جاري جلب السعر الحي والبيانات وتحليل {cfg['name']}...")
     try:
@@ -938,7 +944,7 @@ async def cmd_status(message: types.Message):
     await safe_send(message,
         "حالة Trading Bot\n\n"
         "Telegram: ONLINE\n"
-        f"Twelve Data: {'CONFIGURED' if TWELVE_DATA_API_KEY else 'MISSING API KEY'}\n"
+        f"Twelve Data: {'CONFIGURED' if get_twelve_data_api_key() else 'MISSING API KEY'}\n"
         f"Gemini keys: {len(GEMINI_KEYS)}\n"
         f"Gemini models: {', '.join(GEMINI_MODELS)}\n"
         f"Open trades: {open_count} / {MAX_OPEN_TRADES}\n"
@@ -1154,9 +1160,6 @@ def backtest_ema_rsi(candles: List[dict]) -> dict:
 
 @dp.message(Command("auto_backtest"))
 async def cmd_auto_backtest(message: types.Message):
-    if not TWELVE_DATA_API_KEY:
-        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير موجود، لذلك لا يمكن تنفيذ Backtest حقيقي.")
-        return
     await safe_send(message, "🧪 جاري تنفيذ Backtest حقيقي من البيانات التاريخية المتاحة...")
     results = []
     for _, cfg in ASSETS.items():
@@ -1172,8 +1175,6 @@ async def cmd_auto_backtest(message: types.Message):
 
 @dp.message(Command("weekly_table"))
 async def cmd_weekly_table(message: types.Message):
-    if not TWELVE_DATA_API_KEY:
-        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير موجود."); return
     rows=[]
     for _,cfg in ASSETS.items():
         try:
@@ -1997,7 +1998,7 @@ async def health(request: web.Request):
     return web.json_response({
         "status":"ok", "bot":"Trading Bot",
         "open_trades":len([t for t in open_trades.values() if t.status=="OPEN"]),
-        "market_data_configured":bool(TWELVE_DATA_API_KEY), "gemini_keys":len(GEMINI_KEYS),
+        "market_data_configured":bool(get_twelve_data_api_key()), "gemini_keys":len(GEMINI_KEYS),
         "time":now_local().isoformat(), "monitor_seconds":MONITOR_SECONDS,
         "account_balance":ACCOUNT_BALANCE, "risk_per_trade_pct":RISK_PER_TRADE_PCT,
         "open_risk":current_open_risk(), "daily_risk_exposure":daily_risk_exposure(),
@@ -2016,7 +2017,10 @@ async def start_web_server():
 async def main():
     load_state()
     load_strategies()
-    if not TWELVE_DATA_API_KEY: logger.warning("TWELVE_DATA_API_KEY is missing.")
+    if not get_twelve_data_api_key():
+        logger.warning("TWELVE_DATA_API_KEY is missing from the running environment.")
+    else:
+        logger.info("Twelve Data API key detected in the running environment.")
     if not GEMINI_KEYS: logger.warning("No Gemini API keys configured.")
     runner=await start_web_server()
     monitor_task=asyncio.create_task(trade_monitor())
