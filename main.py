@@ -82,6 +82,7 @@ MIN_TRADE_DURATION_MINUTES = max(1, int(os.getenv("MIN_TRADE_DURATION_MINUTES", 
 MAX_TRADE_DURATION_MINUTES = min(72 * 60, max(MIN_TRADE_DURATION_MINUTES, int(os.getenv("MAX_TRADE_DURATION_MINUTES", str(72 * 60)))))
 VIDEO_TRADE_MAX = max(1, min(50, int(os.getenv("VIDEO_TRADE_MAX", "20"))))
 VIDEO_AGENTIC = os.getenv("VIDEO_AGENTIC", "true").lower() in ("1", "true", "yes", "on")
+SIGNAL_SCORE_THRESHOLD = max(1, int(os.getenv("SIGNAL_SCORE_THRESHOLD", "3")))
 # Market-close protection: trades are never allowed to outlive the next
 # configured market close. Times are UTC. Crypto is 24/7 and has no close.
 MARKET_CLOSE_PROTECTION = os.getenv("MARKET_CLOSE_PROTECTION", "true").lower() in ("1", "true", "yes", "on")
@@ -554,7 +555,7 @@ def analyze_market(asset_key: str, candles: List[dict], live_price: Optional[flo
     elif momentum < 0:
         score -= 1; reasons.append("الزخم القصير سلبي")
 
-    signal = "BUY" if score >= 4 else "SELL" if score <= -4 else "NO TRADE"
+    signal = "BUY" if score >= SIGNAL_SCORE_THRESHOLD else "SELL" if score <= -SIGNAL_SCORE_THRESHOLD else "NO TRADE"
     confidence = min(95.0, max(35.0, 50.0 + abs(score) * 7.0))
     half = a * 0.20
     entry_low, entry_high = price - half, price + half
@@ -2638,6 +2639,15 @@ def _rank_video_trade_setup(setup: VideoTradeSetup) -> float:
 
 
 async def extract_video_trade_setups(source_url: str, source_text: str) -> List[VideoTradeSetup]:
+    # First reuse the structured JSON already returned by the multimodal video
+    # analysis. This avoids a second Gemini call and prevents losing trades when
+    # the abstract strategy parser rejects the video. If no usable JSON exists,
+    # ask Gemini's text model to extract the setups from the visual-analysis text.
+    embedded = extract_json_from_ai(source_text) or {}
+    rows = embedded.get("trade_setups") if isinstance(embedded.get("trade_setups"), list) else embedded.get("trades")
+    if not isinstance(rows, list):
+        rows = None
+
     prompt = f"""
 استخرج صفقات التداول التي قُدمت فعليًا داخل محتوى الفيديو/التحليل التالي.
 لا تنشئ صفقة جديدة من عندك ولا تحوّل مجرد رأي عام إلى صفقة.
@@ -2657,9 +2667,12 @@ async def extract_video_trade_setups(source_url: str, source_text: str) -> List[
 المحتوى:
 {source_text[:50000]}
 """
-    ai = await safe_ai_generate(prompt)
-    obj = extract_json_from_ai(ai) or {}
-    rows = obj.get("trades") if isinstance(obj.get("trades"), list) else []
+    if rows is None:
+        ai = await safe_ai_generate(prompt)
+        obj = extract_json_from_ai(ai) or {}
+        rows = obj.get("trades") if isinstance(obj.get("trades"), list) else obj.get("trade_setups")
+        if not isinstance(rows, list):
+            rows = []
     result: List[VideoTradeSetup] = []
     for raw in rows[:VIDEO_TRADE_MAX]:
         if not isinstance(raw, dict):
@@ -2746,22 +2759,24 @@ async def process_strategy_video(message: types.Message, url: str, original_text
         )
         return
 
-    strategy = await convert_content_to_strategy(url, source)
-    if not strategy:
-        await safe_send(
-            message,
-            "❌ تم استخراج النص، لكن لم أستطع تحويله إلى قواعد تداول قابلة للاختبار "
-            "بالصيغة المدعومة دون اختراع قواعد."
-        )
-        return
-
-    strategies_db["strategies"][strategy.id] = asdict(strategy)
-    save_strategies()
-
-    # Extract the actual trade proposals shown in the video separately from the
-    # abstract strategy. This fixes the old gap where only the strategy was saved.
+    # IMPORTANT: extract concrete trades BEFORE converting the video into an
+    # abstract strategy. A video may contain valid BUY/SELL setups even when its
+    # rules cannot be represented by our StrategyDefinition. The old order
+    # returned early here and silently discarded those setups.
+    setups: List[VideoTradeSetup] = []
     try:
         setups = await extract_video_trade_setups(url, source)
+    except Exception as exc:
+        logger.exception("Video trade extraction failed: %s", exc)
+        _record_video_error(exc)
+
+    strategy = await convert_content_to_strategy(url, source)
+    if strategy:
+        strategies_db["strategies"][strategy.id] = asdict(strategy)
+        save_strategies()
+
+    # Persist and report concrete trade setups independently of strategy conversion.
+    try:
         async with video_trade_lock:
             for setup in setups:
                 video_trade_setups[setup.id] = setup
@@ -2796,6 +2811,15 @@ async def process_strategy_video(message: types.Message, url: str, original_text
     except Exception as exc:
         logger.exception("Video trade extraction failed")
         await safe_send(message, f"⚠️ تم حفظ الاستراتيجية، لكن تعذر استخراج الصفقات منها: {str(exc)[:500]}")
+
+    if not strategy:
+        await safe_send(
+            message,
+            "⚠️ لم أستطع تحويل محتوى الفيديو إلى StrategyDefinition قابلة للتدريب، "
+            "لكن هذا لا يلغي تحليل الصفقات. تم الاحتفاظ بالصفقات التي أمكن قراءتها "
+            "وسأعتمد فقط على الأرقام التي ظهرت فعليًا في الفيديو."
+        )
+        return
 
     await safe_send(
         message,
