@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -36,12 +36,11 @@ except Exception:
 # CONFIGURATION
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-def get_twelve_data_api_key() -> str:
-    """Read the Twelve Data key at runtime so Render environment changes are not
-    hidden behind a stale module-level value. Never log or expose the key.
-    """
-    return os.getenv("TWELVE_DATA_API_KEY", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
+def get_twelve_data_api_key() -> str:
+    """Read the key at request time so Render environment changes are visible."""
+    return os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
 raw_keys = os.getenv("GEMINI_API_KEYS", "").strip()
 if raw_keys:
@@ -73,6 +72,24 @@ MIN_RR = max(0.0, float(os.getenv("MIN_RR", "0.0")))
 MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "30"))
 PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "8"))
 MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "30"))
+MIN_TRADE_DURATION_MINUTES = max(1, int(os.getenv("MIN_TRADE_DURATION_MINUTES", "1")))
+MAX_TRADE_DURATION_MINUTES = min(72 * 60, max(MIN_TRADE_DURATION_MINUTES, int(os.getenv("MAX_TRADE_DURATION_MINUTES", str(72 * 60)))))
+
+# Advanced management / validation switches. These are paper-trading controls;
+# no broker order is sent by this file.
+USE_LEARNED_STRATEGY = os.getenv("USE_LEARNED_STRATEGY", "true").lower() in ("1", "true", "yes", "on")
+LEARNED_STRATEGY_MIN_SCORE = float(os.getenv("LEARNED_STRATEGY_MIN_SCORE", "65"))
+LEARNED_STRATEGY_MIN_ROBUSTNESS = float(os.getenv("LEARNED_STRATEGY_MIN_ROBUSTNESS", "60"))
+TP_ALLOCATION = [float(x) for x in os.getenv("TP_ALLOCATION", "0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10").split(",") if x.strip()]
+if len(TP_ALLOCATION) != 10 or any(x <= 0 for x in TP_ALLOCATION) or abs(sum(TP_ALLOCATION) - 1.0) > 1e-6:
+    TP_ALLOCATION = [0.10] * 10
+BREAK_EVEN_AFTER_TP = max(0, int(os.getenv("BREAK_EVEN_AFTER_TP", "1")))
+TRAILING_AFTER_TP = max(0, int(os.getenv("TRAILING_AFTER_TP", "3")))
+TRAILING_ATR_MULT = max(0.1, float(os.getenv("TRAILING_ATR_MULT", "0.8")))
+MAX_SPREAD_ATR_RATIO = max(0.0, float(os.getenv("MAX_SPREAD_ATR_RATIO", "0.20")))
+STALE_PRICE_SECONDS = max(1, int(os.getenv("STALE_PRICE_SECONDS", "45")))
+NEWS_DB_FILE = os.getenv("NEWS_DB_FILE", "news_learning.json")
+NEWS_EVAL_MINUTES_DEFAULT = max(1, int(os.getenv("NEWS_EVAL_MINUTES_DEFAULT", "60")))
 # Market-close protection: trades are never allowed to outlive the next
 # configured market close. Times are UTC. Crypto is 24/7 and has no close.
 MARKET_CLOSE_PROTECTION = os.getenv("MARKET_CLOSE_PROTECTION", "true").lower() in ("1", "true", "yes", "on")
@@ -225,10 +242,7 @@ price_lock = asyncio.Lock()
 async def td_get(path: str, params: dict) -> dict:
     api_key = get_twelve_data_api_key()
     if not api_key:
-        raise RuntimeError(
-            "TWELVE_DATA_API_KEY is not available to the running Render service. "
-            "Check Environment Variables and redeploy/restart the service."
-        )
+        raise RuntimeError("TWELVE_DATA_API_KEY is not configured in Render Environment Variables.")
     params = dict(params)
     params["apikey"] = api_key
     timeout = aiohttp.ClientTimeout(total=20)
@@ -291,6 +305,39 @@ async def get_time_series(symbol: str, outputsize: int = TD_OUTPUTSIZE) -> List[
         if len(values) < 60:
             raise RuntimeError(f"Not enough candles for {symbol}. Received {len(values)}.")
         market_cache[cache_key] = (datetime.now(timezone.utc), values)
+        return values
+
+async def get_time_series_interval(symbol: str, interval: str, outputsize: int = TD_OUTPUTSIZE) -> List[dict]:
+    """Fetch candles for an explicit interval without changing global TD_INTERVAL."""
+    cache_key = f"{symbol}:{interval}:{outputsize}"
+    now = datetime.now(timezone.utc)
+    cached = market_cache.get(cache_key)
+    if cached and (now - cached[0]).total_seconds() < MARKET_CACHE_SECONDS:
+        return cached[1]
+    async with market_lock:
+        cached = market_cache.get(cache_key)
+        now = datetime.now(timezone.utc)
+        if cached and (now - cached[0]).total_seconds() < MARKET_CACHE_SECONDS:
+            return cached[1]
+        data = await td_get("time_series", {
+            "symbol": symbol, "interval": interval,
+            "outputsize": min(max(outputsize, 60), 5000),
+            "format": "JSON", "timezone": "UTC",
+        })
+        values=[]
+        for row in reversed(data.get("values") or []):
+            try:
+                values.append({
+                    "datetime": row.get("datetime", ""),
+                    "open": float(row["open"]), "high": float(row["high"]),
+                    "low": float(row["low"]), "close": float(row["close"]),
+                    "volume": float(row.get("volume", 0) or 0),
+                })
+            except (ValueError, TypeError, KeyError):
+                continue
+        if len(values) < 60:
+            raise RuntimeError(f"Not enough candles for {symbol} at {interval}. Received {len(values)}.")
+        market_cache[cache_key]=(datetime.now(timezone.utc), values)
         return values
 
 # ============================================================
@@ -395,78 +442,173 @@ class Analysis:
     generated_at: str
 
 
-def analyze_market(asset_key: str, candles: List[dict], live_price: Optional[float] = None) -> Analysis:
+def candle_interval_minutes(interval: str) -> int:
+    """Convert Twelve Data interval text to minutes."""
+    m = re.fullmatch(r"\s*(\d+)\s*(min|h|day|week)\s*", (interval or "5min").lower())
+    if not m:
+        return 5
+    n, unit = int(m.group(1)), m.group(2)
+    return {"min": n, "h": n * 60, "day": n * 1440, "week": n * 10080}[unit]
+
+def estimate_trade_duration_minutes(
+    signal: str,
+    confidence: float,
+    score: int,
+    price: float,
+    atr_value: float,
+    ema20: float,
+    ema50: float,
+    momentum: float,
+    candle_interval_minutes: int,
+) -> int:
+    """Estimate a variable holding time from market structure, not fixed buckets.
+
+    The estimate is intentionally bounded to 1 minute .. 72 hours. It uses
+    volatility, directional momentum, EMA structure, confidence and signal
+    strength. It is an estimate, not a guarantee of how long a trade will need.
+    """
+    if signal not in ("BUY", "SELL") or atr_value <= 0 or price <= 0:
+        return 0
+
+    # Expected directional movement per candle. ATR is the volatility envelope;
+    # momentum supplies a directional-speed component.
+    momentum_speed = abs(momentum) / max(1, min(6, 6))
+    movement_per_candle = max(atr_value * 0.12, momentum_speed * 0.85)
+
+    # Trend alignment increases expected persistence; conflicting EMA structure
+    # shortens the expected holding time.
+    if signal == "BUY":
+        aligned = price > ema20 and ema20 > ema50
+    else:
+        aligned = price < ema20 and ema20 < ema50
+    structure_factor = 1.35 if aligned else 0.82
+
+    strength = min(1.0, abs(score) / 8.0)
+    confidence_factor = 0.80 + min(0.55, max(0.0, confidence - 50.0) / 100.0)
+
+    # Use the midpoint of the TP ladder as the primary expected horizon.
+    # Strong momentum reduces the time; weak momentum increases it.
+    target_distance = atr_value * 2.4
+    raw_bars = target_distance / max(movement_per_candle, atr_value * 0.03)
+    raw_bars *= (1.10 - 0.35 * strength)
+    raw_bars /= structure_factor
+    raw_bars /= confidence_factor
+
+    minutes = raw_bars * max(1, candle_interval_minutes)
+
+    # Give exceptionally strong/weak setups room to naturally span intraday
+    # through multi-day horizons, while never exceeding the requested 72h.
+    if strength >= 0.875 and aligned:
+        minutes *= 0.75
+    elif strength <= 0.50 or not aligned:
+        minutes *= 1.35
+
+    return int(min(MAX_TRADE_DURATION_MINUTES, max(MIN_TRADE_DURATION_MINUTES, round(minutes))))
+
+def format_duration_minutes(minutes: int) -> str:
+    """Human-readable duration for Telegram output."""
+    if minutes < 60:
+        return f"{minutes} دقيقة"
+    if minutes < 1440:
+        hours = minutes / 60.0
+        if abs(hours - round(hours)) < 1e-9:
+            return f"{int(round(hours))} ساعة"
+        return f"{hours:.1f} ساعة"
+    days = minutes / 1440.0
+    if abs(days - round(days)) < 1e-9:
+        return f"{int(round(days))} يوم"
+    return f"{days:.1f} يوم"
+
+def analyze_market(asset_key: str, candles: List[dict], live_price: Optional[float] = None, interval: Optional[str] = None) -> Analysis:
     cfg = ASSETS[asset_key]
-    closes = [x["close"] for x in candles]
-    highs = [x["high"] for x in candles]
-    lows = [x["low"] for x in candles]
-    price = float(live_price if live_price is not None else closes[-1])
-    e20, e50 = ema(closes, 20), ema(closes, 50)
-    r = rsi(closes, 14)
-    a = atr(highs, lows, closes, 14)
-    m_line, m_signal, m_hist = macd(closes)
-    _, _, _ = bollinger(closes)
-    support, resistance = support_resistance(highs, lows, 60)
-    if None in (e20, e50, r, a, m_line, m_signal, m_hist) or a <= 0:
+    if len(candles) < 60:
+        raise RuntimeError("Insufficient candle data")
+    closes=[x["close"] for x in candles]; highs=[x["high"] for x in candles]; lows=[x["low"] for x in candles]
+    price=float(live_price if live_price is not None else closes[-1])
+    e20,e50=ema(closes,20),ema(closes,50); r=rsi(closes,14); a=atr(highs,lows,closes,14)
+    m_line,m_signal,m_hist=macd(closes); support,resistance=support_resistance(highs,lows,60)
+    if None in (e20,e50,r,a,m_line,m_signal,m_hist) or a<=0:
         raise RuntimeError("Insufficient indicator data")
 
-    score = 0
-    reasons = []
-    if price > e20:
-        score += 1; reasons.append("السعر فوق EMA20")
-    else:
-        score -= 1; reasons.append("السعر تحت EMA20")
-    if e20 > e50:
-        score += 2; reasons.append("EMA20 فوق EMA50")
-    else:
-        score -= 2; reasons.append("EMA20 تحت EMA50")
-    if m_hist > 0:
-        score += 2; reasons.append("MACD histogram إيجابي")
-    else:
-        score -= 2; reasons.append("MACD histogram سلبي")
-    if 55 < r < 75:
-        score += 2; reasons.append(f"RSI صاعد ومتوازن: {r:.1f}")
-    elif 25 < r < 45:
-        score -= 2; reasons.append(f"RSI هابط ومتوازن: {r:.1f}")
-    elif r >= 75:
-        score -= 1; reasons.append(f"RSI مرتفع جدًا: {r:.1f}")
-    elif r <= 25:
-        score += 1; reasons.append(f"RSI منخفض جدًا: {r:.1f}")
-    momentum = price - closes[-6]
-    if momentum > 0:
-        score += 1; reasons.append("الزخم القصير إيجابي")
-    elif momentum < 0:
-        score -= 1; reasons.append("الزخم القصير سلبي")
+    score=0; reasons=[]
+    # Correct trend logic: EMA20 > EMA50 is bullish, not bearish.
+    if price > e20: score += 1; reasons.append("السعر فوق EMA20")
+    else: score -= 1; reasons.append("السعر تحت EMA20")
+    if e20 > e50: score += 2; reasons.append("EMA20 فوق EMA50: اتجاه صاعد")
+    elif e20 < e50: score -= 2; reasons.append("EMA20 تحت EMA50: اتجاه هابط")
+    else: reasons.append("EMA20 قريب جدًا من EMA50: اتجاه محايد")
+    if m_hist > 0: score += 2; reasons.append("MACD histogram إيجابي")
+    elif m_hist < 0: score -= 2; reasons.append("MACD histogram سلبي")
+    if 55 < r < 75: score += 2; reasons.append(f"RSI صاعد ومتوازن: {r:.1f}")
+    elif 25 < r < 45: score -= 2; reasons.append(f"RSI هابط ومتوازن: {r:.1f}")
+    elif r >= 75: score -= 1; reasons.append(f"RSI مرتفع جدًا: {r:.1f} — خطر تصحيح")
+    elif r <= 25: score += 1; reasons.append(f"RSI منخفض جدًا: {r:.1f} — ارتداد محتمل")
+    momentum=price-closes[-7] if len(closes)>=7 else 0.0
+    if momentum > 0: score += 1; reasons.append("الزخم القصير إيجابي")
+    elif momentum < 0: score -= 1; reasons.append("الزخم القصير سلبي")
 
-    signal = "BUY" if score >= 4 else "SELL" if score <= -4 else "NO TRADE"
-    confidence = min(95.0, max(35.0, 50.0 + abs(score) * 7.0))
-    half = a * 0.20
-    entry_low, entry_high = price - half, price + half
-    if signal == "BUY":
-        sl = price - a * 1.20
-        tps = [price + a * x for x in (0.8, 1.2, 1.6, 2.0, 2.4, 2.8, 3.2, 3.6, 4.0, 4.5)]
-    elif signal == "SELL":
-        sl = price + a * 1.20
-        tps = [price - a * x for x in (0.8, 1.2, 1.6, 2.0, 2.4, 2.8, 3.2, 3.6, 4.0, 4.5)]
-    else:
-        sl, tps = price, []
-    duration = 0 if signal == "NO TRADE" else 45 if confidence >= 80 else 60 if confidence >= 70 else 90
-    return Analysis(
-        asset_key=asset_key, asset_name=cfg["name"], symbol=cfg["symbol"], price=price,
-        signal=signal, confidence=confidence, entry_low=entry_low, entry_high=entry_high,
-        sl=sl, tps=tps, atr_value=a, rsi_value=r, ema20=e20, ema50=e50,
-        macd_value=m_line, macd_signal=m_signal, macd_hist=m_hist,
-        support=support, resistance=resistance, duration_minutes=duration,
-        score=score, reasons=reasons, generated_at=datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-    )
+    # Avoid forcing a trade when the evidence is internally contradictory.
+    aligned_buy = price > e20 > e50 and m_hist > 0 and momentum > 0
+    aligned_sell = price < e20 < e50 and m_hist < 0 and momentum < 0
+    if score >= 5 and aligned_buy: signal="BUY"
+    elif score <= -5 and aligned_sell: signal="SELL"
+    else: signal="NO TRADE"
 
-async def get_market_snapshot(asset_key: str) -> Tuple[Analysis, List[dict]]:
-    cfg = ASSETS[asset_key]
-    live_price, candles = await asyncio.gather(
-        get_price(cfg["symbol"], use_cache=False),
-        get_time_series(cfg["symbol"]),
-    )
-    return analyze_market(asset_key, candles, live_price=live_price), candles
+    # Confidence is based on agreement, not merely abs(score).
+    directional_points = sum([
+        price > e20 if signal=="BUY" else price < e20 if signal=="SELL" else False,
+        e20 > e50 if signal=="BUY" else e20 < e50 if signal=="SELL" else False,
+        m_hist > 0 if signal=="BUY" else m_hist < 0 if signal=="SELL" else False,
+        55 < r < 75 if signal=="BUY" else 25 < r < 45 if signal=="SELL" else False,
+        momentum > 0 if signal=="BUY" else momentum < 0 if signal=="SELL" else False,
+    ]) if signal != "NO TRADE" else 0
+    confidence = 45.0 + directional_points * 9.0 if signal != "NO TRADE" else 35.0 + min(20.0, abs(score)*3.0)
+    confidence = min(92.0, max(35.0, confidence))
+
+    half=a*0.20; entry_low,entry_high=price-half,price+half
+    if signal=="BUY":
+        sl=price-a*1.20; tps=[price+a*x for x in (0.8,1.2,1.6,2.0,2.4,2.8,3.2,3.6,4.0,4.5)]
+    elif signal=="SELL":
+        sl=price+a*1.20; tps=[price-a*x for x in (0.8,1.2,1.6,2.0,2.4,2.8,3.2,3.6,4.0,4.5)]
+    else: sl=price; tps=[]
+    dur=estimate_trade_duration_minutes(signal,confidence,score,price,a,e20,e50,momentum,candle_interval_minutes(interval or TD_INTERVAL))
+    return Analysis(asset_key=asset_key,asset_name=cfg["name"],symbol=cfg["symbol"],price=price,signal=signal,confidence=confidence,
+        entry_low=entry_low,entry_high=entry_high,sl=sl,tps=tps,atr_value=a,rsi_value=r,ema20=e20,ema50=e50,
+        macd_value=m_line,macd_signal=m_signal,macd_hist=m_hist,support=support,resistance=resistance,duration_minutes=dur,
+        score=score,reasons=reasons,generated_at=datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"))
+
+async def get_market_snapshot(asset_key: str) -> Tuple[Analysis,List[dict]]:
+    cfg=ASSETS[asset_key]
+    live_price, base_candles = await asyncio.gather(get_price(cfg["symbol"],False), get_time_series_interval(cfg["symbol"],TD_INTERVAL,max(TD_OUTPUTSIZE,300)))
+    preliminary=analyze_market(asset_key,base_candles,live_price,TD_INTERVAL)
+    # Choose the analytical timeframe from the preliminary horizon.
+    d=preliminary.duration_minutes
+    if d and d <= 15: interval="1min"; size=300
+    elif d and d <= 180: interval="5min"; size=500
+    elif d and d <= 720: interval="15min"; size=500
+    else: interval="1h"; size=300
+    if interval == TD_INTERVAL:
+        candles=base_candles
+    else:
+        try: candles=await get_time_series_interval(cfg["symbol"],interval,size)
+        except Exception: candles=base_candles; interval=TD_INTERVAL
+    analysis=analyze_market(asset_key,candles,live_price,interval)
+
+    # Use only sufficiently validated learned strategies as a confluence layer.
+    if USE_LEARNED_STRATEGY and strategies_db.get("strategies"):
+        best=top_strategies(1)
+        if best:
+            strategy,result=best[0]
+            if result.score >= LEARNED_STRATEGY_MIN_SCORE and result.robustness >= LEARNED_STRATEGY_MIN_ROBUSTNESS and result.verdict in ("STRONG","PROMISING"):
+                learned=strategy_signal(strategy,candles,len(candles)-1)
+                if learned:
+                    if analysis.signal==learned:
+                        analysis.score += 1; analysis.confidence=min(94.0,analysis.confidence+4); analysis.reasons.append(f"استراتيجية متعلمة متوافقة: {strategy.name}")
+                    elif analysis.signal=="NO TRADE":
+                        analysis.reasons.append(f"استراتيجية متعلمة أعطت {learned} لكن التأكيد الفني غير كافٍ")
+                    else:
+                        analysis.confidence=max(35.0,analysis.confidence-5); analysis.reasons.append(f"تعارض مع الاستراتيجية المتعلمة: {strategy.name}")
+    return analysis,candles
 
 async def improve_analysis_with_ai(analysis: Analysis) -> str:
     prompt = f"""
@@ -506,8 +648,8 @@ def analysis_message(analysis: Analysis, ai_note: str = "", trade_id: Optional[s
     if analysis.signal != "NO TRADE":
         lines += ["", f"وقف الخسارة: {format_price(analysis.sl)}", "الأهداف:"]
         lines += [f"TP{i}: {format_price(tp)}" for i, tp in enumerate(analysis.tps, 1)]
-        lines += ["", f"المدة التقديرية: {analysis.duration_minutes} دقيقة",
-                  f"إعادة التحليل: كل {max(1, round(analysis.duration_minutes * REANALYSIS_PERCENT))} دقائق"]
+        lines += ["", f"المدة التقديرية: {format_duration_minutes(analysis.duration_minutes)} ({analysis.duration_minutes} دقيقة)",
+                  f"إعادة التحليل: كل {format_duration_minutes(max(1, round(analysis.duration_minutes * REANALYSIS_PERCENT)))}"]
     else:
         lines += ["", "لا توجد صفقة ذات أفضلية كافية الآن."]
     lines += ["", "المؤشرات:", f"RSI: {analysis.rsi_value:.2f}",
@@ -558,7 +700,18 @@ class Trade:
     rr_tp1: float = 0.0
     rr_tp10: float = 0.0
     realized_pnl: float = 0.0
+    realized_r: float = 0.0
     close_price: float = 0.0
+    remaining_position_size: float = 0.0
+    closed_quantity: float = 0.0
+    tp_allocations: List[float] = field(default_factory=lambda: [0.10] * 10)
+    tp_realized_pnl: List[float] = field(default_factory=lambda: [0.0] * 10)
+    break_even_price: float = 0.0
+    trailing_stop: float = 0.0
+    trailing_active: bool = False
+    peak_price: float = 0.0
+    expiry_at: str = ""
+    expiry_reason: str = "TIME LIMIT"
     closed_at: str = ""
 
 open_trades: Dict[str, Trade] = {}
@@ -602,7 +755,24 @@ def load_state():
             raw.setdefault("rr_tp1", 0.0)
             raw.setdefault("rr_tp10", 0.0)
             raw.setdefault("realized_pnl", 0.0)
+            raw.setdefault("realized_r", 0.0)
             raw.setdefault("close_price", 0.0)
+            raw.setdefault("remaining_position_size", raw.get("position_size", 0.0))
+            raw.setdefault("closed_quantity", 0.0)
+            raw.setdefault("tp_allocations", [0.10] * 10)
+            raw.setdefault("tp_realized_pnl", [0.0] * 10)
+            raw.setdefault("break_even_price", 0.0)
+            raw.setdefault("trailing_stop", 0.0)
+            raw.setdefault("trailing_active", False)
+            raw.setdefault("peak_price", raw.get("entry_price", 0.0))
+            raw.setdefault("expiry_at", "")
+            raw.setdefault("expiry_reason", "TIME LIMIT")
+            if not raw.get("expiry_at") and raw.get("opened_at"):
+                try:
+                    exp, why = calculate_trade_expiry(dt_from_string(raw["opened_at"]), max(1, int(raw.get("estimated_duration_minutes", 1))), raw.get("asset_key", ""))
+                    raw["expiry_at"], raw["expiry_reason"] = exp.isoformat(), why
+                except Exception:
+                    pass
             raw.setdefault("closed_at", "")
             # Backward compatibility: give older open trades risk metadata
             # without changing their entry/SL.
@@ -741,91 +911,89 @@ def refresh_trade_risk(trade: Trade, analysis: Analysis):
     trade.rr_tp10 = abs(analysis.tps[-1] - analysis.price) / stop_distance if analysis.tps else 0.0
 
 
-def mark_trade_closed(trade: Trade, price: float, action: str, status: str = "CLOSED"):
-    trade.status = status
-    trade.management = "CLOSE"
-    trade.last_action = action
-    trade.close_price = float(price)
-    trade.closed_at = now_local().isoformat()
-    if trade.position_size > 0:
-        if trade.side == "BUY":
-            trade.realized_pnl = (price - trade.entry_price) * trade.position_size
-        elif trade.side == "SELL":
-            trade.realized_pnl = (trade.entry_price - price) * trade.position_size
-
-
 def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None) -> Trade:
-    now = now_local()
-    mins = max(1, round(analysis.duration_minutes * REANALYSIS_PERCENT))
-    expiry, _reason = calculate_trade_expiry(now, analysis.duration_minutes, analysis.asset_key)
-    market_close = next_market_close(analysis.asset_key, now)
-    return Trade(
-        id=uuid.uuid4().hex[:8].upper(), chat_id=chat_id,
-        asset_key=analysis.asset_key, asset_name=analysis.asset_name, symbol=analysis.symbol,
-        side=analysis.signal, entry_low=analysis.entry_low, entry_high=analysis.entry_high,
-        entry_price=analysis.price, sl=analysis.sl, tps=analysis.tps,
-        opened_at=now.isoformat(), estimated_duration_minutes=analysis.duration_minutes,
-        next_reanalysis_at=(now + timedelta(minutes=mins)).isoformat(),
-        market_close_at=market_close.isoformat() if market_close else "",
-        last_price=analysis.price, score=analysis.score, confidence=analysis.confidence,
-        risk_percent=RISK_PER_TRADE_PCT,
-        risk_amount=float((risk or {}).get("risk_amount", 0.0)),
-        position_size=float((risk or {}).get("position_size", 0.0)),
-        rr_tp1=float((risk or {}).get("rr_tp1", 0.0)),
-        rr_tp10=float((risk or {}).get("rr_tp10", 0.0)),
-    )
+    now=now_local(); duration=max(MIN_TRADE_DURATION_MINUTES,min(MAX_TRADE_DURATION_MINUTES,int(analysis.duration_minutes or 1)))
+    expiry,reason=calculate_trade_expiry(now,duration,analysis.asset_key); market_close=next_market_close(analysis.asset_key,now)
+    size=float((risk or {}).get("position_size",0.0))
+    return Trade(id=uuid.uuid4().hex[:8].upper(),chat_id=chat_id,asset_key=analysis.asset_key,asset_name=analysis.asset_name,symbol=analysis.symbol,
+        side=analysis.signal,entry_low=analysis.entry_low,entry_high=analysis.entry_high,entry_price=analysis.price,sl=analysis.sl,tps=list(analysis.tps),
+        opened_at=now.isoformat(),estimated_duration_minutes=duration,next_reanalysis_at=(now+timedelta(minutes=max(1,round(duration*REANALYSIS_PERCENT)))).isoformat(),
+        market_close_at=market_close.isoformat() if market_close else "",last_price=analysis.price,score=analysis.score,confidence=analysis.confidence,
+        risk_percent=RISK_PER_TRADE_PCT,risk_amount=float((risk or {}).get("risk_amount",0.0)),position_size=size,remaining_position_size=size,
+        rr_tp1=float((risk or {}).get("rr_tp1",0.0)),rr_tp10=float((risk or {}).get("rr_tp10",0.0)),tp_allocations=list(TP_ALLOCATION),
+        tp_realized_pnl=[0.0]*10,peak_price=analysis.price,expiry_at=expiry.isoformat(),expiry_reason=reason)
 
 def trade_status_text(trade: Trade) -> str:
-    next_time = dt_from_string(trade.next_reanalysis_at).strftime("%Y-%m-%d %H:%M:%S")
-    reached = ", ".join(f"TP{x}" for x in trade.hit_tps) if trade.hit_tps else "none"
-    return (
-        f"{trade.asset_name} | {trade.side} | {trade.status}\n"
-        f"ID: {trade.id}\n"
-        f"Entry: {format_price(trade.entry_price)}\n"
-        f"SL: {format_price(trade.sl)}\n"
-        f"Last price: {format_price(trade.last_price)}\n"
-        f"Risk: {trade.risk_amount:.2f}$ ({trade.risk_percent:.2f}%)\n"
-        f"Position size: {trade.position_size:.6f} units\n"
-        f"R:R TP1 / TP10: {trade.rr_tp1:.2f} / {trade.rr_tp10:.2f}\n"
-        f"Management: {trade.management}\n"
-        f"Reached TP: {reached}\n"
-        f"Next reanalysis: {next_time}\n"
-        f"Market close: {(dt_from_string(trade.market_close_at).strftime('%Y-%m-%d %H:%M:%S') if trade.market_close_at else '24/7 / no close')}\n"
-        f"Last action: {trade.last_action}"
-    )
+    next_time=dt_from_string(trade.next_reanalysis_at).strftime("%Y-%m-%d %H:%M:%S") if trade.next_reanalysis_at else "-"
+    expiry=dt_from_string(trade.expiry_at).strftime("%Y-%m-%d %H:%M:%S") if trade.expiry_at else "-"
+    reached=", ".join(f"TP{x}" for x in trade.hit_tps) if trade.hit_tps else "none"
+    return (f"{trade.asset_name} | {trade.side} | {trade.status}\nID: {trade.id}\nEntry: {format_price(trade.entry_price)}\n"
+        f"SL: {format_price(trade.sl)}\nLast price: {format_price(trade.last_price)}\nRisk: {trade.risk_amount:.2f}$ ({trade.risk_percent:.2f}%)\n"
+        f"Position: {trade.remaining_position_size:.6f}/{trade.position_size:.6f} units\nEstimated duration: {format_duration_minutes(trade.estimated_duration_minutes)}\nRealized PnL: {trade.realized_pnl:.2f}$ ({trade.realized_r:.2f}R)\n"
+        f"R:R TP1 / TP10: {trade.rr_tp1:.2f} / {trade.rr_tp10:.2f}\nManagement: {trade.management}\nReached TP: {reached}\n"
+        f"Break-even: {format_price(trade.break_even_price) if trade.break_even_price else 'not active'}\n"
+        f"Trailing: {format_price(trade.trailing_stop) if trade.trailing_active else 'not active'}\nNext reanalysis: {next_time}\n"
+        f"Expiry: {expiry} ({trade.expiry_reason})\nMarket close: {(dt_from_string(trade.market_close_at).strftime('%Y-%m-%d %H:%M:%S') if trade.market_close_at else '24/7 / no close')}\n"
+        f"Last action: {trade.last_action}")
 
 def trade_expired(trade: Trade, now: Optional[datetime] = None) -> bool:
-    if trade.status != "OPEN":
-        return False
-    now = now or now_local()
-    opened = dt_from_string(trade.opened_at)
-    expiry, reason = calculate_trade_expiry(opened, trade.estimated_duration_minutes, trade.asset_key)
-    if now >= expiry:
-        trade.last_action = f"EXPIRED - {reason}"
-        return True
+    if trade.status!="OPEN": return False
+    now=now or now_local()
+    if trade.expiry_at:
+        expiry=dt_from_string(trade.expiry_at); reason=trade.expiry_reason or "TIME LIMIT"
+    else:
+        expiry,reason=calculate_trade_expiry(dt_from_string(trade.opened_at),max(1,trade.estimated_duration_minutes),trade.asset_key)
+    if now>=expiry:
+        trade.last_action=f"EXPIRED - {reason}"; return True
     return False
 
+def _pnl_for_qty(trade: Trade, entry: float, price: float, qty: float) -> float:
+    if trade.side=="BUY": return (price-entry)*qty
+    return (entry-price)*qty
 
-def evaluate_trade_price(trade: Trade, price: float) -> List[str]:
-    events = []
-    trade.last_price = price
-    if trade.side == "BUY":
-        if price <= trade.sl:
-            mark_trade_closed(trade, price, "CLOSE - SL"); return ["SL"]
-        for i, tp in enumerate(trade.tps, 1):
-            if i not in trade.hit_tps and price >= tp:
-                trade.hit_tps.append(i); events.append(f"TP{i}")
-    elif trade.side == "SELL":
-        if price >= trade.sl:
-            mark_trade_closed(trade, price, "CLOSE - SL"); return ["SL"]
-        for i, tp in enumerate(trade.tps, 1):
-            if i not in trade.hit_tps and price <= tp:
-                trade.hit_tps.append(i); events.append(f"TP{i}")
-    if events:
-        trade.last_action = events[-1] + " HIT"
-        if len(trade.hit_tps) >= len(trade.tps):
-            mark_trade_closed(trade, price, "CLOSE - FINAL TP")
-            events.append("FINAL TP")
+def _activate_management(trade: Trade, price: float, atr_value: float):
+    if BREAK_EVEN_AFTER_TP and len(trade.hit_tps) >= BREAK_EVEN_AFTER_TP and trade.remaining_position_size > 0:
+        trade.break_even_price=trade.entry_price
+        if (trade.side=="BUY" and trade.sl < trade.entry_price) or (trade.side=="SELL" and trade.sl > trade.entry_price):
+            trade.sl=trade.entry_price
+        trade.management="BREAK-EVEN"
+    if TRAILING_AFTER_TP and len(trade.hit_tps) >= TRAILING_AFTER_TP and trade.remaining_position_size > 0 and atr_value>0:
+        trail=price-atr_value*TRAILING_ATR_MULT if trade.side=="BUY" else price+atr_value*TRAILING_ATR_MULT
+        if not trade.trailing_active:
+            trade.trailing_stop=trail; trade.trailing_active=True
+        elif trade.side=="BUY": trade.trailing_stop=max(trade.trailing_stop,trail)
+        else: trade.trailing_stop=min(trade.trailing_stop,trail)
+        if trade.side=="BUY": trade.sl=max(trade.sl,trade.trailing_stop)
+        else: trade.sl=min(trade.sl,trade.trailing_stop)
+        trade.management="TRAILING"
+
+def mark_trade_closed(trade: Trade, price: float, action: str, status: str="CLOSED"):
+    if trade.status != "OPEN": return
+    if trade.remaining_position_size > 0:
+        pnl=_pnl_for_qty(trade,trade.entry_price,price,trade.remaining_position_size)
+        trade.realized_pnl += pnl; trade.closed_quantity += trade.remaining_position_size
+        trade.remaining_position_size=0.0
+    trade.status=status; trade.management="CLOSE"; trade.last_action=action; trade.close_price=float(price); trade.closed_at=now_local().isoformat()
+    trade.realized_r=(trade.realized_pnl/trade.risk_amount) if trade.risk_amount>0 else 0.0
+
+def evaluate_trade_price(trade: Trade, price: float, atr_value: float=0.0) -> List[str]:
+    events=[]; trade.last_price=float(price); trade.peak_price=max(trade.peak_price,price) if trade.side=="BUY" else min(trade.peak_price or price,price)
+    if trade.status!="OPEN": return events
+    if trade.side=="BUY" and price<=trade.sl: mark_trade_closed(trade,price,"CLOSE - SL"); return ["SL"]
+    if trade.side=="SELL" and price>=trade.sl: mark_trade_closed(trade,price,"CLOSE - SL"); return ["SL"]
+    for i,tp in enumerate(trade.tps,1):
+        if i in trade.hit_tps: continue
+        hit=(price>=tp) if trade.side=="BUY" else (price<=tp)
+        if not hit: continue
+        trade.hit_tps.append(i); events.append(f"TP{i}")
+        alloc=trade.tp_allocations[i-1] if i-1<len(trade.tp_allocations) else 0.10
+        qty=min(trade.remaining_position_size,trade.position_size*alloc)
+        if qty>0:
+            pnl=_pnl_for_qty(trade,trade.entry_price,tp,qty); trade.realized_pnl += pnl; trade.tp_realized_pnl[i-1]=pnl; trade.closed_quantity += qty; trade.remaining_position_size=max(0.0,trade.remaining_position_size-qty)
+        if trade.remaining_position_size <= max(1e-12,trade.position_size*0.0001):
+            mark_trade_closed(trade,price,"CLOSE - FINAL TP"); events.append("FINAL TP"); return events
+    _activate_management(trade,price,atr_value)
+    if events: trade.last_action=events[-1]+" HIT"
     return events
 
 # ============================================================
@@ -839,7 +1007,7 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
         save_state()
         # Analysis is only needed by callers that expect it; fetch one current snapshot.
     analysis, _candles = await get_market_snapshot(trade.asset_key)
-    events = evaluate_trade_price(trade, analysis.price)
+    events = evaluate_trade_price(trade, analysis.price, analysis.atr_value)
     trade.last_review_at = now.isoformat()
 
     if trade.status != "OPEN":
@@ -858,6 +1026,7 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
         trade.management = "ADJUST"
         trade.last_action = "ADJUST - DIRECTION CHANGED"
         # Apply the new technical plan instead of merely reporting it.
+        remaining_fraction = (trade.remaining_position_size / trade.position_size) if trade.position_size > 0 else 1.0
         trade.side = analysis.signal
         trade.entry_low = analysis.entry_low
         trade.entry_high = analysis.entry_high
@@ -866,10 +1035,18 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
         trade.tps = analysis.tps
         trade.hit_tps = []
         trade.notified_tps = []
+        trade.closed_quantity = 0.0
+        trade.tp_realized_pnl = [0.0] * 10
         trade.estimated_duration_minutes = max(1, analysis.duration_minutes)
         refresh_trade_risk(trade, analysis)
+        trade.remaining_position_size = trade.position_size * max(0.0, min(1.0, remaining_fraction))
+        trade.closed_quantity = trade.position_size - trade.remaining_position_size
+        trade.break_even_price = 0.0
+        trade.trailing_stop = 0.0
+        trade.trailing_active = False
         close_at = next_market_close(trade.asset_key, now)
         trade.market_close_at = close_at.isoformat() if close_at else ""
+        trade.expiry_at, trade.expiry_reason = (lambda x: (x[0].isoformat(), x[1]))(calculate_trade_expiry(now, trade.estimated_duration_minutes, trade.asset_key))
 
     trade.last_price = analysis.price
     trade.score = analysis.score
@@ -882,7 +1059,25 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
 # ============================================================
 # ASSET COMMANDS
 # ============================================================
+async def market_quality_gate(analysis: Analysis) -> Tuple[bool, str]:
+    """Optional spread/quality protection. If quote fields are unavailable, do not invent a spread."""
+    if MAX_SPREAD_ATR_RATIO <= 0 or analysis.atr_value <= 0:
+        return True, "quality checks disabled"
+    try:
+        data = await td_get("quote", {"symbol": analysis.symbol, "format": "JSON"})
+        bid = float(data.get("bid")); ask = float(data.get("ask"))
+        spread = max(0.0, ask-bid)
+        if spread > analysis.atr_value * MAX_SPREAD_ATR_RATIO:
+            return False, f"السبريد {spread:.6f} أكبر من {MAX_SPREAD_ATR_RATIO:.2f}×ATR ({analysis.atr_value:.6f})."
+    except Exception:
+        # Twelve Data does not expose bid/ask for every instrument/data plan.
+        return True, "spread unavailable; not used"
+    return True, "OK"
+
 async def perform_asset_analysis(message: types.Message, asset_key: str, create_new_trade: bool = True):
+    if not get_twelve_data_api_key():
+        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير متاح داخل عملية البوت.")
+        return
     cfg = ASSETS[asset_key]
     await safe_send(message, f"🔄 جاري جلب السعر الحي والبيانات وتحليل {cfg['name']}...")
     try:
@@ -902,6 +1097,10 @@ async def perform_asset_analysis(message: types.Message, asset_key: str, create_
                 return
             if len([t for t in open_trades.values() if t.status == "OPEN"]) >= MAX_OPEN_TRADES:
                 await safe_send(message, "⚠️ تم الوصول إلى الحد الأقصى للصفقات المفتوحة.")
+                return
+            quality_ok, quality_reason = await market_quality_gate(analysis)
+            if not quality_ok:
+                await safe_send(message, analysis_message(analysis, ai_note) + f"\n\n🛡️ لم تُفتح الصفقة بسبب جودة السوق: {quality_reason}")
                 return
             allowed, risk_reason, risk = risk_gate(analysis)
             if not allowed:
@@ -1126,40 +1325,52 @@ async def cmd_retrain(message: types.Message):
 # BACKTEST
 # ============================================================
 def backtest_ema_rsi(candles: List[dict]) -> dict:
-    closes = [x["close"] for x in candles]; highs = [x["high"] for x in candles]; lows = [x["low"] for x in candles]
-    if len(candles) < 120:
-        return {"trades": 0, "wins": 0, "losses": 0, "win_rate": 0, "note": "Not enough historical candles."}
-    trades = wins = losses = 0
-    i = 60
-    while i < len(candles) - 10:
-        c, h, l = closes[:i+1], highs[:i+1], lows[:i+1]
-        e20, e50, rr, aa = ema(c,20), ema(c,50), rsi(c,14), atr(h,l,c,14)
-        if None in (e20,e50,rr,aa) or aa <= 0:
-            i += 1; continue
-        price = c[-1]
-        side = "BUY" if price > e20 > e50 and rr > 55 else "SELL" if price < e20 < e50 and rr < 45 else None
-        if not side:
-            i += 1; continue
-        trades += 1
-        sl = price - aa*1.2 if side == "BUY" else price + aa*1.2
-        tp = price + aa*1.6 if side == "BUY" else price - aa*1.6
-        result = None
-        for j in range(i+1, min(i+11, len(candles))):
-            bar = candles[j]
-            if side == "BUY":
-                if bar["low"] <= sl: result = "LOSS"; break
-                if bar["high"] >= tp: result = "WIN"; break
-            else:
-                if bar["high"] >= sl: result = "LOSS"; break
-                if bar["low"] <= tp: result = "WIN"; break
-        if result == "WIN": wins += 1
-        else: losses += 1
-        i += 10
-    return {"trades": trades, "wins": wins, "losses": losses, "win_rate": round(wins/trades*100,2) if trades else 0,
-            "note": "Historical walk-forward simulation using returned candles; not a future-performance guarantee."}
+    """Baseline backtest using the same directional logic and 10-TP management."""
+    if len(candles)<140: return {"trades":0,"wins":0,"losses":0,"win_rate":0,"profit_factor":0,"net_r":0,"max_drawdown_r":0,"expectancy_r":0,"sharpe_like":0,"note":"Not enough historical candles."}
+    results=[]; durations=[]; i=60
+    while i < len(candles)-12:
+        c=[x["close"] for x in candles[:i+1]]; h=[x["high"] for x in candles[:i+1]]; l=[x["low"] for x in candles[:i+1]]
+        e20,e50,rr,aa=ema(c,20),ema(c,50),rsi(c,14),atr(h,l,c,14)
+        if None in (e20,e50,rr,aa) or aa<=0: i+=1; continue
+        price=c[-1]
+        side="BUY" if price>e20>e50 and rr>55 else "SELL" if price<e20<e50 and rr<45 else None
+        if not side: i+=1; continue
+        sl=price-aa*1.2 if side=="BUY" else price+aa*1.2
+        tps=[price+aa*x for x in (0.8,1.2,1.6,2.0,2.4,2.8,3.2,3.6,4.0,4.5)] if side=="BUY" else [price-aa*x for x in (0.8,1.2,1.6,2.0,2.4,2.8,3.2,3.6,4.0,4.5)]
+        remaining=1.0; realized=0.0; hit=[]; trail=sl; be=False; exit_j=None
+        for j in range(i+1,min(i+1+max(12,72),len(candles))):
+            bar=candles[j]
+            # Conservative OHLC assumption: SL first when SL and TP are both touched.
+            if side=="BUY" and bar["low"]<=trail:
+                realized += remaining*((trail-price)/aa); exit_j=j; break
+            if side=="SELL" and bar["high"]>=trail:
+                realized += remaining*((price-trail)/aa); exit_j=j; break
+            for n,tp in enumerate(tps,1):
+                if n in hit: continue
+                touched=(bar["high"]>=tp) if side=="BUY" else (bar["low"]<=tp)
+                if touched:
+                    alloc=0.10; realized += alloc*((tp-price)/aa if side=="BUY" else (price-tp)/aa); remaining-=alloc; hit.append(n)
+                    if len(hit)>=BREAK_EVEN_AFTER_TP and not be:
+                        trail=price; be=True
+                    if len(hit)>=TRAILING_AFTER_TP:
+                        candidate=bar["close"]-aa*TRAILING_ATR_MULT if side=="BUY" else bar["close"]+aa*TRAILING_ATR_MULT
+                        trail=max(trail,candidate) if side=="BUY" else min(trail,candidate)
+                    if remaining<=1e-9: exit_j=j; break
+            if exit_j is not None: break
+        if exit_j is None:
+            exit_j=min(len(candles)-1,i+72); exit_price=candles[exit_j]["close"]; realized += remaining*((exit_price-price)/aa if side=="BUY" else (price-exit_price)/aa)
+        results.append(realized); durations.append(max(1,(exit_j or i)-i)); i += max(1,(exit_j or i)-i)
+    trades=[r for r in results if r!=0]; wins=[r for r in trades if r>0]; losses=[r for r in trades if r<0]; gp=sum(wins); gl=abs(sum(losses)); pf=gp/gl if gl else (99.0 if gp else 0.0); net=sum(trades); wr=len(wins)/len(trades)*100 if trades else 0; exp=net/len(trades) if trades else 0
+    eq=peak=dd=0.0
+    for r in results: eq+=r; peak=max(peak,eq); dd=max(dd,peak-eq)
+    _,_,_,_,sh=_series_metrics(results)
+    return {"trades":len(trades),"wins":len(wins),"losses":len(losses),"win_rate":round(wr,2),"profit_factor":round(pf,3),"net_r":round(net,3),"max_drawdown_r":round(dd,3),"expectancy_r":round(exp,4),"sharpe_like":round(sh,4),"avg_duration_bars":round(sum(durations)/len(durations),2) if durations else 0,"note":"Walk-forward-style historical simulation with 10 TP allocations, break-even and trailing management. Conservative SL-first OHLC assumption."}
 
 @dp.message(Command("auto_backtest"))
 async def cmd_auto_backtest(message: types.Message):
+    if not get_twelve_data_api_key():
+        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير متاح للعملية الحالية.")
+        return
     await safe_send(message, "🧪 جاري تنفيذ Backtest حقيقي من البيانات التاريخية المتاحة...")
     results = []
     for _, cfg in ASSETS.items():
@@ -1170,11 +1381,13 @@ async def cmd_auto_backtest(message: types.Message):
         results.append((cfg["name"], result))
     text = "🧪 نتائج Backtest الحقيقي\n\n"
     for name, r in results:
-        text += f"{name}\nTrades: {r['trades']}\nWins: {r['wins']}\nLosses: {r['losses']}\nWin rate: {r['win_rate']}%\nNote: {r['note']}\n\n"
+        text += f"{name}\nTrades: {r['trades']}\nWins: {r['wins']}\nLosses: {r['losses']}\nWin rate: {r['win_rate']}%\nPF: {r.get('profit_factor',0)} | Net R: {r.get('net_r',0)}\nMax DD: {r.get('max_drawdown_r',0)}R | Expectancy: {r.get('expectancy_r',0)}R\nSharpe-like: {r.get('sharpe_like',0)}\nAvg duration: {r.get('avg_duration_bars',0)} bars\nNote: {r['note']}\n\n"
     await safe_send(message, text + "⚠️ الاختبار تاريخي وليس ضمانًا للنتائج المستقبلية.")
 
 @dp.message(Command("weekly_table"))
 async def cmd_weekly_table(message: types.Message):
+    if not get_twelve_data_api_key():
+        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير متاح للعملية الحالية."); return
     rows=[]
     for _,cfg in ASSETS.items():
         try:
@@ -1224,10 +1437,71 @@ class StrategyResult:
     trained_at: str
     assets_tested: int = 0
     r_values: List[float] = field(default_factory=list)
+    oos_trades: int = 0
+    oos_win_rate: float = 0.0
+    oos_profit_factor: float = 0.0
+    oos_net_r: float = 0.0
+    sharpe_like: float = 0.0
 
 
 strategies_db: Dict[str, dict] = {"strategies": {}, "results": {}}
 strategy_db_lock = asyncio.Lock()
+
+news_learning: Dict[str, dict] = {"records": {}}
+news_lock = asyncio.Lock()
+
+def load_news_learning():
+    global news_learning
+    if not os.path.exists(NEWS_DB_FILE): return
+    try:
+        with open(NEWS_DB_FILE,"r",encoding="utf-8") as f: data=json.load(f)
+        if isinstance(data,dict): news_learning={"records":data.get("records",{})}
+    except Exception: logger.exception("Could not load news learning")
+
+def save_news_learning():
+    try:
+        tmp=NEWS_DB_FILE+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f: json.dump(news_learning,f,ensure_ascii=False,indent=2)
+        os.replace(tmp,NEWS_DB_FILE)
+    except Exception: logger.exception("Could not save news learning")
+
+def _parse_news_json(text: str) -> Optional[dict]:
+    data=extract_json_from_ai(text)
+    if not data: return None
+    assets=[a for a in data.get("assets",[]) if a in ASSETS]
+    direction=str(data.get("direction","unknown")).lower()
+    if direction not in ("bullish","bearish","mixed","unknown"): direction="unknown"
+    try: strength=max(1,min(5,int(data.get("strength",0))))
+    except Exception: strength=0
+    try: horizon=max(1,min(4320,int(data.get("horizon_minutes",NEWS_EVAL_MINUTES_DEFAULT))))
+    except Exception: horizon=NEWS_EVAL_MINUTES_DEFAULT
+    return {"assets":assets,"direction":direction,"strength":strength,"horizon_minutes":horizon,"summary":str(data.get("summary", ""))[:1000]}
+
+async def evaluate_news_learning():
+    due=[]; now=now_local()
+    for rid,rec in list(news_learning.get("records",{}).items()):
+        if rec.get("evaluated") or not rec.get("due_at"): continue
+        try:
+            if dt_from_string(rec["due_at"])<=now: due.append((rid,rec))
+        except Exception: continue
+    changed=False
+    for rid,rec in due:
+        assets=rec.get("assets",[])
+        outcomes=[]
+        for asset in assets:
+            try:
+                current=await get_price(ASSETS[asset]["symbol"],use_cache=False)
+                start=float(rec.get("prices",{}).get(asset,0));
+                if start<=0: continue
+                move=current-start
+                actual="bullish" if move>0 else "bearish" if move<0 else "flat"
+                predicted=rec.get("direction","unknown")
+                correct=(predicted==actual) if predicted in ("bullish","bearish") else None
+                outcomes.append({"asset":asset,"start":start,"end":current,"move":move,"actual":actual,"correct":correct})
+            except Exception as exc: logger.warning("News outcome failed %s/%s: %s",rid,asset,exc)
+        rec["outcomes"]=outcomes; rec["evaluated"]=True; rec["evaluated_at"]=now.isoformat(); changed=True
+    if changed: save_news_learning()
+
 
 
 def load_strategies():
@@ -1600,6 +1874,16 @@ def simulate_strategy_test(strategy: StrategyDefinition, candles: List[dict], st
     return 0.0
 
 
+def _series_metrics(values: List[float]) -> Tuple[int,float,float,float,float]:
+    trades=[r for r in values if r!=0.0]; wins=[r for r in trades if r>0]; losses=[r for r in trades if r<0]
+    gp=sum(wins); gl=abs(sum(losses)); pf=gp/gl if gl>0 else (99.0 if gp>0 else 0.0)
+    wr=(len(wins)/len(trades)*100.0) if trades else 0.0
+    net=sum(trades);
+    if len(trades)>1:
+        mean=sum(trades)/len(trades); var=sum((x-mean)**2 for x in trades)/(len(trades)-1); sharpe=mean/math.sqrt(var)*math.sqrt(len(trades)) if var>0 else (99.0 if mean>0 else 0.0)
+    else: sharpe=0.0
+    return len(trades),wr,pf,net,sharpe
+
 def calculate_strategy_metrics(strategy_id: str, r_values: List[float], tests: int, assets_tested: int) -> StrategyResult:
     trades = [r for r in r_values if r != 0.0]
     wins = [r for r in trades if r > 0]
@@ -1649,6 +1933,7 @@ def calculate_strategy_metrics(strategy_id: str, r_values: List[float], tests: i
     else:
         verdict = "FAILED"
 
+    _, _, _, _, sharpe_like = _series_metrics(r_values)
     return StrategyResult(
         strategy_id=strategy_id,
         tests=tests,
@@ -1667,63 +1952,35 @@ def calculate_strategy_metrics(strategy_id: str, r_values: List[float], tests: i
         trained_at=now_local().isoformat(),
         assets_tested=assets_tested,
         r_values=[round(x, 6) for x in r_values],
+        sharpe_like=round(sharpe_like, 4),
     )
 
 
 async def train_strategy(strategy: StrategyDefinition) -> StrategyResult:
+    """Train on the first 70% of sampled history and validate on the last 30%."""
     async with STRATEGY_TRAINING_LOCK:
-        training_status.update({
-            "running": True,
-            "strategy_id": strategy.id,
-            "strategy_name": strategy.name,
-            "tests": 0,
-            "trades": 0,
-            "message": "loading historical candles",
-        })
-        all_r = []
-        assets_tested = 0
-
+        training_status.update({"running":True,"strategy_id":strategy.id,"strategy_name":strategy.name,"tests":0,"trades":0,"message":"loading historical candles"})
+        all_r=[]; oos_r=[]; assets_tested=0
         try:
-            for asset_key, cfg in ASSETS.items():
+            for asset_key,cfg in ASSETS.items():
                 try:
-                    candles = await get_time_series(cfg["symbol"], 500)
-                    max_index = len(candles) - strategy.max_hold_bars - 1
-                    first_index = 60
-                    if max_index <= first_index:
-                        continue
-
-                    available = max_index - first_index + 1
-                    count = min(TRAINING_TESTS, available)
-
-                    # Evenly distributed walk-forward samples across the history.
-                    if count == 1:
-                        indices = [first_index]
-                    else:
-                        indices = sorted(set(
-                            first_index + round(i * (available - 1) / (count - 1))
-                            for i in range(count)
-                        ))
-
-                    for idx in indices:
-                        r = simulate_strategy_test(strategy, candles, idx)
-                        all_r.append(r)
-
-                    assets_tested += 1
-                    training_status["tests"] = len(all_r)
-                    training_status["trades"] = sum(1 for x in all_r if x != 0.0)
-                    training_status["message"] = f"testing {asset_key}"
-                except Exception as exc:
-                    logger.warning("Strategy training failed on %s: %s", asset_key, exc)
-
-            result = calculate_strategy_metrics(strategy.id, all_r, len(all_r), assets_tested)
-            strategies_db["results"][strategy.id] = asdict(result)
-            strategies_db["strategies"][strategy.id] = asdict(strategy)
-            save_strategies()
-            return result
+                    candles=await get_time_series(cfg["symbol"],500); max_index=len(candles)-strategy.max_hold_bars-1; first_index=60
+                    if max_index<=first_index: continue
+                    available=max_index-first_index+1; count=min(TRAINING_TESTS,available)
+                    if count==1: indices=[first_index]
+                    else: indices=sorted(set(first_index+round(i*(available-1)/(count-1)) for i in range(count)))
+                    split=max(1,int(len(indices)*0.70)); train_indices=indices[:split]; test_indices=indices[split:]
+                    for idx in train_indices: all_r.append(simulate_strategy_test(strategy,candles,idx))
+                    for idx in test_indices:
+                        r=simulate_strategy_test(strategy,candles,idx); all_r.append(r); oos_r.append(r)
+                    assets_tested+=1; training_status["tests"]=len(all_r); training_status["trades"]=sum(1 for x in all_r if x!=0.0); training_status["message"]=f"testing {asset_key}"
+                except Exception as exc: logger.warning("Strategy training failed on %s: %s",asset_key,exc)
+            result=calculate_strategy_metrics(strategy.id,all_r,len(all_r),assets_tested)
+            oos_trades,oos_wr,oos_pf,oos_net,_=_series_metrics(oos_r)
+            result.oos_trades=oos_trades; result.oos_win_rate=round(oos_wr,2); result.oos_profit_factor=round(oos_pf,3); result.oos_net_r=round(oos_net,3)
+            strategies_db["results"][strategy.id]=asdict(result); strategies_db["strategies"][strategy.id]=asdict(strategy); save_strategies(); return result
         finally:
-            training_status["running"] = False
-            training_status["message"] = "complete"
-
+            training_status["running"]=False; training_status["message"]="complete"
 
 def strategy_from_db(strategy_id: str) -> Optional[StrategyDefinition]:
     raw = strategies_db.get("strategies", {}).get(strategy_id)
@@ -1770,6 +2027,8 @@ def strategy_display(strategy: StrategyDefinition, result: Optional[StrategyResu
             f"Net R: {result.net_r}",
             f"Max drawdown R: {result.max_drawdown_r}",
             f"Expectancy R: {result.expectancy_r}",
+            f"OOS: {result.oos_trades} trades | WR {result.oos_win_rate}% | PF {result.oos_profit_factor} | Net R {result.oos_net_r}",
+            f"Sharpe-like: {result.sharpe_like}",
             f"Score: {result.score}/100",
             f"Robustness: {result.robustness}/100",
             f"Verdict: {result.verdict}",
@@ -1852,54 +2111,55 @@ def detect_assets_in_text(text: str) -> List[str]:
     return found
 
 async def process_news_or_strategy(message: types.Message, text: str):
-    forward_origin = getattr(message, "forward_origin", None)
-    is_forward = forward_origin is not None
-    url = extract_url(text)
+    forward_origin=getattr(message,"forward_origin",None); is_forward=forward_origin is not None
+    url=extract_url(text)
     if url and is_video_url(url):
-        await process_strategy_video(message, url, text)
-        return
-
-    is_strategy_text = "استراتيجية" in text.lower() or "strategy" in text.lower()
-    kind = "خبر مُعاد توجيهه" if is_forward else ("استراتيجية/نص" if is_strategy_text else "خبر")
-    await safe_send(message, f"🧠 جاري تحليل {kind}...")
-
-    prompt = f"""
+        await process_strategy_video(message,url,text); return
+    is_strategy_text="استراتيجية" in text.lower() or "strategy" in text.lower()
+    kind="خبر مُعاد توجيهه" if is_forward else ("استراتيجية/نص" if is_strategy_text else "خبر")
+    await safe_send(message,f"🧠 جاري تحليل {kind}...")
+    prompt=f"""
 حلل النص التالي كمحلل مخاطر للأسواق. لا تخترع تفاصيل.
+أخرج JSON فقط بالشكل:
+{{"assets":[],"direction":"bullish|bearish|mixed|unknown","strength":1,"horizon_minutes":60,"summary":"..."}}
+assets يجب أن تكون فقط من: {list(ASSETS.keys())}.
+إذا لم يذكر النص أصلًا بوضوح، اجعل assets فارغة. horizon_minutes بين 1 و4320.
 النص:
-{text}
-حدد: نوع المحتوى، الأصول المتأثرة، اتجاه التأثير bullish/bearish/mixed/unknown،
-قوة 1-5، المدة دقائق/ساعات/أيام، وما يجب مراقبته.
-لا تضمن الربح.
-إذا كان النص يحتوي رابط فيديو ولم يتوفر محتواه الفعلي، لا تدّع أنك شاهدت الفيديو.
+{text[:12000]}
 """
-    ai = await safe_ai_generate(prompt) or "تعذر الوصول إلى Gemini حاليًا. تم استلام النص ويمكن إعادة المحاولة."
+    ai=await safe_ai_generate(prompt)
+    parsed=_parse_news_json(ai)
+    if parsed:
+        display=(f"النوع: {kind}\nالأصول: {', '.join(parsed['assets']) or 'غير محددة'}\n"
+                 f"التأثير: {parsed['direction']}\nالقوة: {parsed['strength']}/5\n"
+                 f"الأفق: {format_duration_minutes(parsed['horizon_minutes'])}\n{parsed['summary']}")
+    else:
+        display=ai or "تعذر الوصول إلى Gemini حاليًا. تم استلام النص ويمكن إعادة المحاولة."
 
-    os.makedirs("memory", exist_ok=True)
-    filename = "memory/strategies_memory.txt" if is_strategy_text else "memory/news_memory.txt"
+    os.makedirs("memory",exist_ok=True)
+    filename="memory/strategies_memory.txt" if is_strategy_text else "memory/news_memory.txt"
     try:
-        with open(filename, "a", encoding="utf-8") as f:
-            f.write(
-                f"\n[{now_local().isoformat()}]\nTYPE: {kind}\nTEXT:\n{text}\n"
-                f"ANALYSIS:\n{ai}\n" + "=" * 70 + "\n"
-            )
-    except Exception:
-        logger.exception("Could not save memory")
+        with open(filename,"a",encoding="utf-8") as f: f.write(f"\n[{now_local().isoformat()}]\nTYPE: {kind}\nTEXT:\n{text}\nANALYSIS:\n{display}\n"+"="*70+"\n")
+    except Exception: logger.exception("Could not save memory")
 
-    await safe_send(message, f"📰 تحليل {kind}\n\n{ai}")
+    if parsed and not is_strategy_text and parsed["assets"] and parsed["direction"] in ("bullish","bearish"):
+        prices={}
+        for asset in parsed["assets"]:
+            try: prices[asset]=await get_price(ASSETS[asset]["symbol"],False)
+            except Exception: pass
+        rid="NEWS-"+uuid.uuid4().hex[:10].upper(); now=now_local()
+        news_learning["records"][rid]={"id":rid,"created_at":now.isoformat(),"due_at":(now+timedelta(minutes=parsed["horizon_minutes"])).isoformat(),
+            "assets":parsed["assets"],"direction":parsed["direction"],"strength":parsed["strength"],"horizon_minutes":parsed["horizon_minutes"],"prices":prices,"evaluated":False,"outcomes":[]}
+        save_news_learning()
+        display += f"\n\n🧠 News Learning ID: {rid}\nسيتم قياس النتيجة بعد {format_duration_minutes(parsed['horizon_minutes'])}."
 
-    affected = detect_assets_in_text(text)
-    for trade in [t for t in list(open_trades.values()) if t.status == "OPEN" and t.asset_key in affected]:
+    await safe_send(message,f"📰 تحليل {kind}\n\n{display}")
+    affected=detect_assets_in_text(text)
+    for trade in [t for t in list(open_trades.values()) if t.status=="OPEN" and t.asset_key in affected]:
         try:
-            trade, analysis, events = await reanalyze_trade(trade, reason="news")
-            await safe_reply(
-                trade.chat_id,
-                f"⚡ إعادة تحليل فورية بسبب خبر\nالأصل: {trade.asset_name}\nTrade ID: {trade.id}\n"
-                f"السعر: {format_price(analysis.price)}\nالإشارة: {analysis.signal}\n"
-                f"الحالة: {trade.status}\nالإجراء: {trade.last_action}\n"
-                f"TP events: {', '.join(events) if events else 'none'}"
-            )
-        except Exception:
-            logger.exception("News reanalysis failed")
+            trade,analysis,events=await reanalyze_trade(trade,reason="news")
+            await safe_reply(trade.chat_id,f"⚡ إعادة تحليل فورية بسبب خبر\nالأصل: {trade.asset_name}\nTrade ID: {trade.id}\nالسعر: {format_price(analysis.price)}\nالإشارة: {analysis.signal}\nالحالة: {trade.status}\nالإجراء: {trade.last_action}\nTP events: {', '.join(events) if events else 'none'}")
+        except Exception: logger.exception("News reanalysis failed")
 
 
 @dp.message(F.text)
@@ -1982,6 +2242,7 @@ async def trade_monitor():
                     logger.exception("Scheduled reanalysis failed for %s: %s",trade.id,exc)
                     trade.last_action="DATA ERROR - RETRY"
                     save_state()
+            await evaluate_news_learning()
             # Keep at most 100 closed/expired records.
             closed=[tid for tid,t in open_trades.items() if t.status!="OPEN"]
             if len(closed)>100:
@@ -2017,10 +2278,8 @@ async def start_web_server():
 async def main():
     load_state()
     load_strategies()
-    if not get_twelve_data_api_key():
-        logger.warning("TWELVE_DATA_API_KEY is missing from the running environment.")
-    else:
-        logger.info("Twelve Data API key detected in the running environment.")
+    load_news_learning()
+    if not get_twelve_data_api_key(): logger.warning("TWELVE_DATA_API_KEY is missing.")
     if not GEMINI_KEYS: logger.warning("No Gemini API keys configured.")
     runner=await start_web_server()
     monitor_task=asyncio.create_task(trade_monitor())
