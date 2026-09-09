@@ -10,6 +10,7 @@ import tempfile
 import shutil
 import sys
 import time
+import sqlite3
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,11 @@ try:
 except Exception:
     TelegramBadRequest = Exception
     TelegramForbiddenError = Exception
+
+try:
+    import psycopg
+except Exception:
+    psycopg = None
 
 try:
     from google import genai
@@ -96,6 +102,13 @@ TRAILING_AFTER_TP = max(1, int(os.getenv("TRAILING_AFTER_TP", "3")))
 TRAILING_ATR_MULT = max(0.1, float(os.getenv("TRAILING_ATR_MULT", "0.8")))
 STALE_PRICE_SECONDS = max(5, int(os.getenv("STALE_PRICE_SECONDS", "45")))
 NEWS_DB_FILE = os.getenv("NEWS_DB_FILE", "news_learning.json")
+# Persistent storage. On Render, set DATABASE_URL to a Render Postgres database.
+# SQLite is retained only as a local/fallback store.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PERSISTENCE_DB_FILE = os.getenv("PERSISTENCE_DB_FILE", "tradingbot.sqlite3")
+SELF_PING_ENABLED = os.getenv("SELF_PING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+SELF_PING_INTERVAL_SECONDS = max(60, int(os.getenv("SELF_PING_INTERVAL_SECONDS", "300")))
+PUBLIC_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", os.getenv("PUBLIC_BASE_URL", "")).strip().rstrip("/")
 STRATEGY_TRAINING_LOCK = asyncio.Lock()
 training_status = {
     "running": False,
@@ -710,9 +723,146 @@ def dt_from_string(value: str) -> datetime:
     dt = datetime.fromisoformat(value)
     return dt if dt.tzinfo else dt.replace(tzinfo=LOCAL_TZ)
 
+# ============================================================
+# PERSISTENT STORAGE
+# ============================================================
+# Render's local filesystem is ephemeral. When DATABASE_URL is configured,
+# all durable bot state is stored in Postgres. The local JSON/SQLite paths are
+# kept as a development/fallback mechanism and are also used for one-time
+# migration of old state.
+
+_persistence_initialized = False
+_persistence_backend = "local"
+
+
+def _pg_connect():
+    if not DATABASE_URL or psycopg is None:
+        return None
+    return psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=10)
+
+
+def init_persistence():
+    global _persistence_initialized, _persistence_backend
+    if _persistence_initialized:
+        return
+    if DATABASE_URL and psycopg is not None:
+        try:
+            with _pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS bot_kv (
+                            key TEXT PRIMARY KEY,
+                            value JSONB NOT NULL,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                    """)
+            _persistence_backend = "postgres"
+            _persistence_initialized = True
+            logger.info("Persistent storage: PostgreSQL")
+            return
+        except Exception:
+            logger.exception("PostgreSQL initialization failed; using local fallback")
+    elif DATABASE_URL and psycopg is None:
+        logger.error("DATABASE_URL is set but psycopg is not installed; using local fallback")
+
+    try:
+        with sqlite3.connect(PERSISTENCE_DB_FILE, timeout=10) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS bot_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            conn.commit()
+        _persistence_backend = "sqlite"
+        _persistence_initialized = True
+        logger.warning("Persistent storage: local SQLite fallback (%s); Render persistence requires DATABASE_URL", PERSISTENCE_DB_FILE)
+    except Exception:
+        logger.exception("Could not initialize local persistence")
+        _persistence_backend = "local"
+        _persistence_initialized = True
+
+
+def _persistent_get(key: str):
+    init_persistence()
+    try:
+        if _persistence_backend == "postgres":
+            with _pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT value FROM bot_kv WHERE key=%s", (key,))
+                    row = cur.fetchone()
+                    return row[0] if row else None
+        if _persistence_backend == "sqlite":
+            with sqlite3.connect(PERSISTENCE_DB_FILE, timeout=10) as conn:
+                row = conn.execute("SELECT value FROM bot_kv WHERE key=?", (key,)).fetchone()
+                return json.loads(row[0]) if row else None
+    except Exception:
+        logger.exception("Persistent read failed for key %s", key)
+    return None
+
+
+def _persistent_set(key: str, value):
+    init_persistence()
+    try:
+        if _persistence_backend == "postgres":
+            with _pg_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO bot_kv(key,value,updated_at) VALUES (%s,%s::jsonb,NOW())
+                        ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+                    """, (key, json.dumps(value, ensure_ascii=False)))
+            return True
+        if _persistence_backend == "sqlite":
+            with sqlite3.connect(PERSISTENCE_DB_FILE, timeout=10) as conn:
+                conn.execute("""
+                    INSERT INTO bot_kv(key,value,updated_at) VALUES (?,?,datetime('now'))
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')
+                """, (key, json.dumps(value, ensure_ascii=False)))
+                conn.commit()
+            return True
+    except Exception:
+        logger.exception("Persistent write failed for key %s", key)
+    return False
+
+
+def persistence_status() -> str:
+    init_persistence()
+    return _persistence_backend
+
+
+def migrate_legacy_json_to_persistence():
+    """Import old JSON files once, without overwriting newer DB state."""
+    init_persistence()
+    if persistence_status() == "postgres":
+        if _persistent_get("trades") is None and os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    legacy = json.load(f)
+                if isinstance(legacy, dict):
+                    _persistent_set("trades", legacy)
+                    logger.info("Migrated %s legacy trades to PostgreSQL", len(legacy))
+            except Exception:
+                logger.exception("Legacy trade migration failed")
+        if _persistent_get("strategies") is None and os.path.exists(STRATEGY_DB_FILE):
+            try:
+                with open(STRATEGY_DB_FILE, "r", encoding="utf-8") as f:
+                    legacy = json.load(f)
+                if isinstance(legacy, dict):
+                    _persistent_set("strategies", legacy)
+                    logger.info("Migrated legacy strategies database to PostgreSQL")
+            except Exception:
+                logger.exception("Legacy strategy migration failed")
+        if _persistent_get("news_learning") is None and os.path.exists(NEWS_DB_FILE):
+            try:
+                with open(NEWS_DB_FILE, "r", encoding="utf-8") as f:
+                    legacy = json.load(f)
+                if isinstance(legacy, dict):
+                    _persistent_set("news_learning", legacy)
+                    logger.info("Migrated legacy news learning database to PostgreSQL")
+            except Exception:
+                logger.exception("Legacy news migration failed")
+
+
 def save_state():
     try:
         data = {k: asdict(v) for k, v in open_trades.items()}
+        if _persistent_set("trades", data):
+            return
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -720,13 +870,18 @@ def save_state():
     except Exception:
         logger.exception("Could not save state")
 
+
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _persistent_get("trades")
+        if data is None and os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            return
         for tid, raw in data.items():
+            if not isinstance(raw, dict):
+                continue
             raw.setdefault("hit_tps", [])
             raw.setdefault("notified_tps", [])
             raw.setdefault("last_review_at", "")
@@ -753,18 +908,8 @@ def load_state():
             raw.setdefault("peak_price", raw.get("entry_price", 0.0))
             raw.setdefault("expiry_at", "")
             raw.setdefault("expiry_reason", "TIME LIMIT")
-            # Backward compatibility: give older open trades risk metadata
-            # without changing their entry/SL.
-            if raw.get("status") == "OPEN" and float(raw.get("risk_amount", 0.0) or 0.0) <= 0:
-                stop_distance = abs(float(raw.get("entry_price", 0.0)) - float(raw.get("sl", 0.0)))
-                if ACCOUNT_BALANCE > 0 and stop_distance > 0:
-                    raw["risk_percent"] = RISK_PER_TRADE_PCT
-                    raw["risk_amount"] = ACCOUNT_BALANCE * RISK_PER_TRADE_PCT / 100.0
-                    raw["position_size"] = raw["risk_amount"] / stop_distance
-                    raw["rr_tp1"] = abs(float(raw.get("tps", [0.0])[0]) - float(raw.get("entry_price", 0.0))) / stop_distance if raw.get("tps") else 0.0
-                    raw["rr_tp10"] = abs(float(raw.get("tps", [0.0])[-1]) - float(raw.get("entry_price", 0.0))) / stop_distance if raw.get("tps") else 0.0
             open_trades[tid] = Trade(**raw)
-        logger.info("Loaded %s trades from state", len(open_trades))
+        logger.info("Loaded %s trades from %s", len(open_trades), persistence_status())
     except Exception:
         logger.exception("Could not load state")
 
@@ -1612,23 +1757,22 @@ strategy_db_lock = asyncio.Lock()
 
 def load_strategies():
     global strategies_db
-    if not os.path.exists(STRATEGY_DB_FILE):
-        return
     try:
-        with open(STRATEGY_DB_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _persistent_get("strategies")
+        if data is None and os.path.exists(STRATEGY_DB_FILE):
+            with open(STRATEGY_DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
         if isinstance(data, dict):
-            strategies_db = {
-                "strategies": data.get("strategies", {}),
-                "results": data.get("results", {}),
-            }
-        logger.info("Loaded %s learned strategies", len(strategies_db["strategies"]))
+            strategies_db = {"strategies": data.get("strategies", {}), "results": data.get("results", {})}
+        logger.info("Loaded %s learned strategies from %s", len(strategies_db["strategies"]), persistence_status())
     except Exception:
         logger.exception("Could not load strategy database")
 
 
 def save_strategies():
     try:
+        if _persistent_set("strategies", strategies_db):
+            return
         tmp = STRATEGY_DB_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(strategies_db, f, ensure_ascii=False, indent=2)
@@ -1770,24 +1914,32 @@ def _download_video_for_ai(url: str, tmp_dir: str) -> Optional[str]:
     return str(files[0])
 
 
-def _gemini_video_url_analyze_sync(url: str, prompt: str, key: str, models: List[str]) -> str:
-    """Analyze a public YouTube video directly through Gemini, without yt-dlp.
+VIDEO_LAST_ERROR = ""
 
-    Gemini's video URL input is especially useful on Render because it avoids
-    relying on YouTube's downloader, cookies, format extraction, or subtitles.
+def _record_video_error(exc: Exception):
+    global VIDEO_LAST_ERROR
+    VIDEO_LAST_ERROR = str(exc)[:1200]
+
+
+def _gemini_video_url_analyze_sync(url: str, prompt: str, key: str, models: List[str]) -> str:
+    """Analyze a public YouTube video directly through Gemini.
+
+    Uses the current Interactions video input first, then the documented
+    generate_content/file_data form as a compatibility fallback. This avoids
+    making YouTube downloading a hard dependency for public YouTube videos.
     """
     if genai is None or not key:
         return ""
     client = genai.Client(api_key=key)
     last_error = ""
     for model in models:
+        # Current Interactions API.
         try:
-            # Interactions is the current multimodal video path.
             interaction = client.interactions.create(
                 model=model,
                 input=[
-                    {"type": "video", "uri": url},
                     {"type": "text", "text": prompt},
+                    {"type": "video", "uri": url},
                 ],
             )
             text = getattr(interaction, "output_text", None)
@@ -1795,10 +1947,29 @@ def _gemini_video_url_analyze_sync(url: str, prompt: str, key: str, models: List
                 return str(text).strip()
         except Exception as exc:
             last_error = str(exc)
-            low = last_error.lower()
-            if any(x in low for x in ("not found", "404", "unsupported", "does not exist", "invalid model")):
-                continue
-            raise
+            _record_video_error(exc)
+
+        # Compatibility fallback documented for the Generate Content API.
+        try:
+            from google.genai import types
+            response = client.models.generate_content(
+                model=model,
+                contents=types.Content(parts=[
+                    types.Part(file_data=types.FileData(file_uri=url)),
+                    types.Part(text=prompt),
+                ]),
+            )
+            text = getattr(response, "text", None)
+            if text:
+                return str(text).strip()
+        except Exception as exc:
+            last_error = str(exc)
+            _record_video_error(exc)
+
+        low = last_error.lower()
+        if any(x in low for x in ("not found", "404", "unsupported", "does not exist", "invalid model")):
+            continue
+
     if last_error:
         raise RuntimeError(last_error)
     return ""
@@ -1835,7 +2006,8 @@ def _gemini_video_analyze_sync(video_path: str, prompt: str, key: str, models: L
                         "type": "video",
                         "uri": uploaded.uri,
                         "mime_type": getattr(uploaded, "mime_type", "video/mp4"),
-                        "processing": {"type": "static", "fps": float(os.getenv("VIDEO_ANALYSIS_FPS", "0.5"))},
+                        # Omit processing metadata for maximum SDK compatibility;
+                        # Gemini's default video processing is static and timestamped.
                     },
                     {"type": "text", "text": prompt},
                 ],
@@ -1898,6 +2070,7 @@ async def analyze_video_visually(url: str) -> str:
             try:
                 return await asyncio.to_thread(callable_fn, key)
             except Exception as exc:
+                _record_video_error(exc)
                 low = str(exc).lower()
                 if any(x in low for x in ("429", "quota", "rate limit", "resource exhausted", "too many requests")):
                     key_manager.cooldown(key, 60)
@@ -2300,8 +2473,9 @@ async def process_strategy_video(message: types.Message, url: str, original_text
         await safe_send(
             message,
             "❌ تعذر الوصول إلى محتوى الفيديو أو تحليله.\n"
-            "تأكد أن الرابط عام ويمكن تنزيله بواسطة yt-dlp، وأن Gemini API مضبوط في Render.\n"
-            "لن أختلق محتوى الفيديو أو قواعد غير موجودة."
+            "تمت تجربة Gemini مباشرةً لروابط YouTube ثم مسار yt-dlp + Gemini Files API.\n"
+            "لن أختلق محتوى الفيديو أو قواعد غير موجودة.\n"
+            + (f"\n🔎 آخر خطأ تقني: {VIDEO_LAST_ERROR[:700]}" if VIDEO_LAST_ERROR else "\n🔎 السبب التقني غير متاح؛ تحقق من Gemini API وRender Logs.")
         )
         return
 
@@ -2361,17 +2535,28 @@ news_learning: Dict[str,dict] = {"items": []}
 def load_news_learning():
     global news_learning
     try:
-        if os.path.exists(NEWS_DB_FILE):
-            with open(NEWS_DB_FILE,"r",encoding="utf-8") as f: news_learning=json.load(f)
-            if not isinstance(news_learning,dict): news_learning={"items":[]}
-    except Exception: logger.exception("Could not load news learning")
+        data = _persistent_get("news_learning")
+        if data is None and os.path.exists(NEWS_DB_FILE):
+            with open(NEWS_DB_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        news_learning = data if isinstance(data, dict) else {"items": []}
+        news_learning.setdefault("items", [])
+        logger.info("Loaded %s news-learning records from %s", len(news_learning["items"]), persistence_status())
+    except Exception:
+        logger.exception("Could not load news learning")
+
 
 def save_news_learning():
     try:
-        tmp=NEWS_DB_FILE+".tmp"
-        with open(tmp,"w",encoding="utf-8") as f: json.dump(news_learning,f,ensure_ascii=False,indent=2)
-        os.replace(tmp,NEWS_DB_FILE)
-    except Exception: logger.exception("Could not save news learning")
+        if _persistent_set("news_learning", news_learning):
+            return
+        tmp = NEWS_DB_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(news_learning, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, NEWS_DB_FILE)
+    except Exception:
+        logger.exception("Could not save news learning")
+
 
 def parse_news_prediction(ai_text:str, source_text:str) -> dict:
     obj=extract_json_from_ai(ai_text) or {}
@@ -2560,6 +2745,29 @@ async def trade_monitor():
             logger.exception("Trade monitor loop error")
         await asyncio.sleep(MONITOR_SECONDS)
 
+async def self_ping_loop():
+    """Keep a Render free web service warm while it is running.
+
+    This is only a best-effort mitigation. For guaranteed 24/7 availability,
+    use an external uptime monitor or a paid/always-on Render service.
+    """
+    if not SELF_PING_ENABLED or not PUBLIC_BASE_URL:
+        logger.info("Self-ping disabled or RENDER_EXTERNAL_URL/PUBLIC_BASE_URL not set")
+        return
+    url = PUBLIC_BASE_URL + "/health"
+    await asyncio.sleep(30)
+    timeout = aiohttp.ClientTimeout(total=15)
+    while True:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers={"User-Agent": "TradingBot-keepalive/1.0"}) as resp:
+                    logger.info("Self-ping %s -> HTTP %s", url, resp.status)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Self-ping failed: %s", exc)
+        await asyncio.sleep(SELF_PING_INTERVAL_SECONDS)
+
 # ============================================================
 # HEALTH SERVER
 # ============================================================
@@ -2584,6 +2792,8 @@ async def start_web_server():
 # STARTUP / SHUTDOWN
 # ============================================================
 async def main():
+    init_persistence()
+    migrate_legacy_json_to_persistence()
     load_state()
     load_strategies()
     load_news_learning()
@@ -2591,6 +2801,7 @@ async def main():
     if not GEMINI_KEYS: logger.warning("No Gemini API keys configured.")
     runner=await start_web_server()
     monitor_task=asyncio.create_task(trade_monitor())
+    keepalive_task=asyncio.create_task(self_ping_loop())
     try:
         try:
             await bot.delete_webhook(drop_pending_updates=False)
@@ -2600,7 +2811,10 @@ async def main():
         await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())
     finally:
         monitor_task.cancel()
+        keepalive_task.cancel()
         try: await monitor_task
+        except asyncio.CancelledError: pass
+        try: await keepalive_task
         except asyncio.CancelledError: pass
         save_state()
         try: await runner.cleanup()
