@@ -9,10 +9,11 @@ import subprocess
 import tempfile
 import shutil
 import sys
+import time
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -36,11 +37,10 @@ except Exception:
 # CONFIGURATION
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
-
 def get_twelve_data_api_key() -> str:
-    """Read the key at request time so Render environment changes are visible."""
     return os.getenv("TWELVE_DATA_API_KEY", "").strip()
+
+TWELVE_DATA_API_KEY = get_twelve_data_api_key()
 
 raw_keys = os.getenv("GEMINI_API_KEYS", "").strip()
 if raw_keys:
@@ -74,22 +74,6 @@ PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "8"))
 MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "30"))
 MIN_TRADE_DURATION_MINUTES = max(1, int(os.getenv("MIN_TRADE_DURATION_MINUTES", "1")))
 MAX_TRADE_DURATION_MINUTES = min(72 * 60, max(MIN_TRADE_DURATION_MINUTES, int(os.getenv("MAX_TRADE_DURATION_MINUTES", str(72 * 60)))))
-
-# Advanced management / validation switches. These are paper-trading controls;
-# no broker order is sent by this file.
-USE_LEARNED_STRATEGY = os.getenv("USE_LEARNED_STRATEGY", "true").lower() in ("1", "true", "yes", "on")
-LEARNED_STRATEGY_MIN_SCORE = float(os.getenv("LEARNED_STRATEGY_MIN_SCORE", "65"))
-LEARNED_STRATEGY_MIN_ROBUSTNESS = float(os.getenv("LEARNED_STRATEGY_MIN_ROBUSTNESS", "60"))
-TP_ALLOCATION = [float(x) for x in os.getenv("TP_ALLOCATION", "0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10").split(",") if x.strip()]
-if len(TP_ALLOCATION) != 10 or any(x <= 0 for x in TP_ALLOCATION) or abs(sum(TP_ALLOCATION) - 1.0) > 1e-6:
-    TP_ALLOCATION = [0.10] * 10
-BREAK_EVEN_AFTER_TP = max(0, int(os.getenv("BREAK_EVEN_AFTER_TP", "1")))
-TRAILING_AFTER_TP = max(0, int(os.getenv("TRAILING_AFTER_TP", "3")))
-TRAILING_ATR_MULT = max(0.1, float(os.getenv("TRAILING_ATR_MULT", "0.8")))
-MAX_SPREAD_ATR_RATIO = max(0.0, float(os.getenv("MAX_SPREAD_ATR_RATIO", "0.20")))
-STALE_PRICE_SECONDS = max(1, int(os.getenv("STALE_PRICE_SECONDS", "45")))
-NEWS_DB_FILE = os.getenv("NEWS_DB_FILE", "news_learning.json")
-NEWS_EVAL_MINUTES_DEFAULT = max(1, int(os.getenv("NEWS_EVAL_MINUTES_DEFAULT", "60")))
 # Market-close protection: trades are never allowed to outlive the next
 # configured market close. Times are UTC. Crypto is 24/7 and has no close.
 MARKET_CLOSE_PROTECTION = os.getenv("MARKET_CLOSE_PROTECTION", "true").lower() in ("1", "true", "yes", "on")
@@ -100,7 +84,18 @@ MARKET_CLOSE_BUFFER_MINUTES = int(os.getenv("MARKET_CLOSE_BUFFER_MINUTES", "5"))
 STATE_FILE = os.getenv("STATE_FILE", "trading_state.json")
 STRATEGY_DB_FILE = os.getenv("STRATEGY_DB_FILE", "strategies_db.json")
 TRAINING_TESTS = max(70, int(os.getenv("TRAINING_TESTS", "70")))
-STRATEGY_MIN_TRADES = int(os.getenv("STRATEGY_MIN_TRADES", "10"))
+STRATEGY_MIN_TRADES = max(70, int(os.getenv("STRATEGY_MIN_TRADES", "70")))
+OOS_MIN_TRADES = max(20, int(os.getenv("OOS_MIN_TRADES", "20")))
+USE_LEARNED_STRATEGY = os.getenv("USE_LEARNED_STRATEGY", "true").lower() in ("1", "true", "yes", "on")
+LEARNED_MIN_SCORE = float(os.getenv("LEARNED_MIN_SCORE", "65"))
+TP_ALLOCATION = [float(x) for x in os.getenv("TP_ALLOCATION", "0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10,0.10").split(",")]
+if len(TP_ALLOCATION) != 10 or abs(sum(TP_ALLOCATION)-1.0) > 1e-6:
+    TP_ALLOCATION = [0.10] * 10
+BREAK_EVEN_AFTER_TP = max(1, int(os.getenv("BREAK_EVEN_AFTER_TP", "1")))
+TRAILING_AFTER_TP = max(1, int(os.getenv("TRAILING_AFTER_TP", "3")))
+TRAILING_ATR_MULT = max(0.1, float(os.getenv("TRAILING_ATR_MULT", "0.8")))
+STALE_PRICE_SECONDS = max(5, int(os.getenv("STALE_PRICE_SECONDS", "45")))
+NEWS_DB_FILE = os.getenv("NEWS_DB_FILE", "news_learning.json")
 STRATEGY_TRAINING_LOCK = asyncio.Lock()
 training_status = {
     "running": False,
@@ -240,11 +235,11 @@ market_lock = asyncio.Lock()
 price_lock = asyncio.Lock()
 
 async def td_get(path: str, params: dict) -> dict:
-    api_key = get_twelve_data_api_key()
-    if not api_key:
+    key = get_twelve_data_api_key()
+    if not key:
         raise RuntimeError("TWELVE_DATA_API_KEY is not configured in Render Environment Variables.")
     params = dict(params)
-    params["apikey"] = api_key
+    params["apikey"] = key
     timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get("https://api.twelvedata.com/" + path, params=params) as response:
@@ -307,42 +302,24 @@ async def get_time_series(symbol: str, outputsize: int = TD_OUTPUTSIZE) -> List[
         market_cache[cache_key] = (datetime.now(timezone.utc), values)
         return values
 
-async def get_time_series_interval(symbol: str, interval: str, outputsize: int = TD_OUTPUTSIZE) -> List[dict]:
-    """Fetch candles for an explicit interval without changing global TD_INTERVAL."""
-    cache_key = f"{symbol}:{interval}:{outputsize}"
-    now = datetime.now(timezone.utc)
-    cached = market_cache.get(cache_key)
-    if cached and (now - cached[0]).total_seconds() < MARKET_CACHE_SECONDS:
-        return cached[1]
-    async with market_lock:
-        cached = market_cache.get(cache_key)
-        now = datetime.now(timezone.utc)
-        if cached and (now - cached[0]).total_seconds() < MARKET_CACHE_SECONDS:
-            return cached[1]
-        data = await td_get("time_series", {
-            "symbol": symbol, "interval": interval,
-            "outputsize": min(max(outputsize, 60), 5000),
-            "format": "JSON", "timezone": "UTC",
-        })
-        values=[]
-        for row in reversed(data.get("values") or []):
-            try:
-                values.append({
-                    "datetime": row.get("datetime", ""),
-                    "open": float(row["open"]), "high": float(row["high"]),
-                    "low": float(row["low"]), "close": float(row["close"]),
-                    "volume": float(row.get("volume", 0) or 0),
-                })
-            except (ValueError, TypeError, KeyError):
-                continue
-        if len(values) < 60:
-            raise RuntimeError(f"Not enough candles for {symbol} at {interval}. Received {len(values)}.")
-        market_cache[cache_key]=(datetime.now(timezone.utc), values)
-        return values
-
 # ============================================================
 # INDICATORS
 # ============================================================
+async def get_time_series_interval(symbol: str, interval: str, outputsize: int = 300) -> List[dict]:
+    cache_key=f"{symbol}:{interval}:{outputsize}"
+    now=datetime.now(timezone.utc); cached=market_cache.get(cache_key)
+    if cached and (now-cached[0]).total_seconds()<MARKET_CACHE_SECONDS: return cached[1]
+    async with market_lock:
+        cached=market_cache.get(cache_key); now=datetime.now(timezone.utc)
+        if cached and (now-cached[0]).total_seconds()<MARKET_CACHE_SECONDS: return cached[1]
+        data=await td_get("time_series",{"symbol":symbol,"interval":interval,"outputsize":min(max(outputsize,60),5000),"format":"JSON","timezone":"UTC"})
+        values=[]
+        for row in reversed(data.get("values") or []):
+            try: values.append({"datetime":row.get("datetime",""),"open":float(row["open"]),"high":float(row["high"]),"low":float(row["low"]),"close":float(row["close"]),"volume":float(row.get("volume",0) or 0)})
+            except Exception: continue
+        if len(values)<60: raise RuntimeError(f"Insufficient {interval} candles for {symbol}")
+        market_cache[cache_key]=(datetime.now(timezone.utc),values); return values
+
 def ema_series(values: List[float], period: int) -> List[float]:
     if not values:
         return []
@@ -519,96 +496,104 @@ def format_duration_minutes(minutes: int) -> str:
         return f"{int(round(days))} يوم"
     return f"{days:.1f} يوم"
 
-def analyze_market(asset_key: str, candles: List[dict], live_price: Optional[float] = None, interval: Optional[str] = None) -> Analysis:
+def analyze_market(asset_key: str, candles: List[dict], live_price: Optional[float] = None, interval_minutes: Optional[int] = None) -> Analysis:
     cfg = ASSETS[asset_key]
-    if len(candles) < 60:
-        raise RuntimeError("Insufficient candle data")
-    closes=[x["close"] for x in candles]; highs=[x["high"] for x in candles]; lows=[x["low"] for x in candles]
-    price=float(live_price if live_price is not None else closes[-1])
-    e20,e50=ema(closes,20),ema(closes,50); r=rsi(closes,14); a=atr(highs,lows,closes,14)
-    m_line,m_signal,m_hist=macd(closes); support,resistance=support_resistance(highs,lows,60)
-    if None in (e20,e50,r,a,m_line,m_signal,m_hist) or a<=0:
+    closes = [x["close"] for x in candles]
+    highs = [x["high"] for x in candles]
+    lows = [x["low"] for x in candles]
+    price = float(live_price if live_price is not None else closes[-1])
+    e20, e50 = ema(closes, 20), ema(closes, 50)
+    r = rsi(closes, 14)
+    a = atr(highs, lows, closes, 14)
+    m_line, m_signal, m_hist = macd(closes)
+    _, _, _ = bollinger(closes)
+    support, resistance = support_resistance(highs, lows, 60)
+    if None in (e20, e50, r, a, m_line, m_signal, m_hist) or a <= 0:
         raise RuntimeError("Insufficient indicator data")
 
-    score=0; reasons=[]
-    # Correct trend logic: EMA20 > EMA50 is bullish, not bearish.
-    if price > e20: score += 1; reasons.append("السعر فوق EMA20")
-    else: score -= 1; reasons.append("السعر تحت EMA20")
-    if e20 > e50: score += 2; reasons.append("EMA20 فوق EMA50: اتجاه صاعد")
-    elif e20 < e50: score -= 2; reasons.append("EMA20 تحت EMA50: اتجاه هابط")
-    else: reasons.append("EMA20 قريب جدًا من EMA50: اتجاه محايد")
-    if m_hist > 0: score += 2; reasons.append("MACD histogram إيجابي")
-    elif m_hist < 0: score -= 2; reasons.append("MACD histogram سلبي")
-    if 55 < r < 75: score += 2; reasons.append(f"RSI صاعد ومتوازن: {r:.1f}")
-    elif 25 < r < 45: score -= 2; reasons.append(f"RSI هابط ومتوازن: {r:.1f}")
-    elif r >= 75: score -= 1; reasons.append(f"RSI مرتفع جدًا: {r:.1f} — خطر تصحيح")
-    elif r <= 25: score += 1; reasons.append(f"RSI منخفض جدًا: {r:.1f} — ارتداد محتمل")
-    momentum=price-closes[-7] if len(closes)>=7 else 0.0
-    if momentum > 0: score += 1; reasons.append("الزخم القصير إيجابي")
-    elif momentum < 0: score -= 1; reasons.append("الزخم القصير سلبي")
-
-    # Avoid forcing a trade when the evidence is internally contradictory.
-    aligned_buy = price > e20 > e50 and m_hist > 0 and momentum > 0
-    aligned_sell = price < e20 < e50 and m_hist < 0 and momentum < 0
-    if score >= 5 and aligned_buy: signal="BUY"
-    elif score <= -5 and aligned_sell: signal="SELL"
-    else: signal="NO TRADE"
-
-    # Confidence is based on agreement, not merely abs(score).
-    directional_points = sum([
-        price > e20 if signal=="BUY" else price < e20 if signal=="SELL" else False,
-        e20 > e50 if signal=="BUY" else e20 < e50 if signal=="SELL" else False,
-        m_hist > 0 if signal=="BUY" else m_hist < 0 if signal=="SELL" else False,
-        55 < r < 75 if signal=="BUY" else 25 < r < 45 if signal=="SELL" else False,
-        momentum > 0 if signal=="BUY" else momentum < 0 if signal=="SELL" else False,
-    ]) if signal != "NO TRADE" else 0
-    confidence = 45.0 + directional_points * 9.0 if signal != "NO TRADE" else 35.0 + min(20.0, abs(score)*3.0)
-    confidence = min(92.0, max(35.0, confidence))
-
-    half=a*0.20; entry_low,entry_high=price-half,price+half
-    if signal=="BUY":
-        sl=price-a*1.20; tps=[price+a*x for x in (0.8,1.2,1.6,2.0,2.4,2.8,3.2,3.6,4.0,4.5)]
-    elif signal=="SELL":
-        sl=price+a*1.20; tps=[price-a*x for x in (0.8,1.2,1.6,2.0,2.4,2.8,3.2,3.6,4.0,4.5)]
-    else: sl=price; tps=[]
-    dur=estimate_trade_duration_minutes(signal,confidence,score,price,a,e20,e50,momentum,candle_interval_minutes(interval or TD_INTERVAL))
-    return Analysis(asset_key=asset_key,asset_name=cfg["name"],symbol=cfg["symbol"],price=price,signal=signal,confidence=confidence,
-        entry_low=entry_low,entry_high=entry_high,sl=sl,tps=tps,atr_value=a,rsi_value=r,ema20=e20,ema50=e50,
-        macd_value=m_line,macd_signal=m_signal,macd_hist=m_hist,support=support,resistance=resistance,duration_minutes=dur,
-        score=score,reasons=reasons,generated_at=datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"))
-
-async def get_market_snapshot(asset_key: str) -> Tuple[Analysis,List[dict]]:
-    cfg=ASSETS[asset_key]
-    live_price, base_candles = await asyncio.gather(get_price(cfg["symbol"],False), get_time_series_interval(cfg["symbol"],TD_INTERVAL,max(TD_OUTPUTSIZE,300)))
-    preliminary=analyze_market(asset_key,base_candles,live_price,TD_INTERVAL)
-    # Choose the analytical timeframe from the preliminary horizon.
-    d=preliminary.duration_minutes
-    if d and d <= 15: interval="1min"; size=300
-    elif d and d <= 180: interval="5min"; size=500
-    elif d and d <= 720: interval="15min"; size=500
-    else: interval="1h"; size=300
-    if interval == TD_INTERVAL:
-        candles=base_candles
+    score = 0
+    reasons = []
+    if price > e20:
+        score += 1; reasons.append("السعر فوق EMA20")
     else:
-        try: candles=await get_time_series_interval(cfg["symbol"],interval,size)
-        except Exception: candles=base_candles; interval=TD_INTERVAL
-    analysis=analyze_market(asset_key,candles,live_price,interval)
+        score -= 1; reasons.append("السعر تحت EMA20")
+    if e20 > e50:
+        score += 2; reasons.append("EMA20 فوق EMA50")
+    else:
+        score -= 2; reasons.append("EMA20 تحت EMA50")
+    if m_hist > 0:
+        score += 2; reasons.append("MACD histogram إيجابي")
+    else:
+        score -= 2; reasons.append("MACD histogram سلبي")
+    if 55 < r < 75:
+        score += 2; reasons.append(f"RSI صاعد ومتوازن: {r:.1f}")
+    elif 25 < r < 45:
+        score -= 2; reasons.append(f"RSI هابط ومتوازن: {r:.1f}")
+    elif r >= 75:
+        score -= 1; reasons.append(f"RSI مرتفع جدًا: {r:.1f}")
+    elif r <= 25:
+        score += 1; reasons.append(f"RSI منخفض جدًا: {r:.1f}")
+    momentum = price - closes[-6]
+    if momentum > 0:
+        score += 1; reasons.append("الزخم القصير إيجابي")
+    elif momentum < 0:
+        score -= 1; reasons.append("الزخم القصير سلبي")
 
-    # Use only sufficiently validated learned strategies as a confluence layer.
-    if USE_LEARNED_STRATEGY and strategies_db.get("strategies"):
-        best=top_strategies(1)
-        if best:
-            strategy,result=best[0]
-            if result.score >= LEARNED_STRATEGY_MIN_SCORE and result.robustness >= LEARNED_STRATEGY_MIN_ROBUSTNESS and result.verdict in ("STRONG","PROMISING"):
-                learned=strategy_signal(strategy,candles,len(candles)-1)
-                if learned:
-                    if analysis.signal==learned:
-                        analysis.score += 1; analysis.confidence=min(94.0,analysis.confidence+4); analysis.reasons.append(f"استراتيجية متعلمة متوافقة: {strategy.name}")
-                    elif analysis.signal=="NO TRADE":
-                        analysis.reasons.append(f"استراتيجية متعلمة أعطت {learned} لكن التأكيد الفني غير كافٍ")
-                    else:
-                        analysis.confidence=max(35.0,analysis.confidence-5); analysis.reasons.append(f"تعارض مع الاستراتيجية المتعلمة: {strategy.name}")
-    return analysis,candles
+    signal = "BUY" if score >= 4 else "SELL" if score <= -4 else "NO TRADE"
+    confidence = min(95.0, max(35.0, 50.0 + abs(score) * 7.0))
+    half = a * 0.20
+    entry_low, entry_high = price - half, price + half
+    if signal == "BUY":
+        sl = price - a * 1.20
+        tps = [price + a * x for x in (0.8, 1.2, 1.6, 2.0, 2.4, 2.8, 3.2, 3.6, 4.0, 4.5)]
+    elif signal == "SELL":
+        sl = price + a * 1.20
+        tps = [price - a * x for x in (0.8, 1.2, 1.6, 2.0, 2.4, 2.8, 3.2, 3.6, 4.0, 4.5)]
+    else:
+        sl, tps = price, []
+    duration = estimate_trade_duration_minutes(
+        signal=signal,
+        confidence=confidence,
+        score=score,
+        price=price,
+        atr_value=a,
+        ema20=e20,
+        ema50=e50,
+        momentum=momentum,
+        candle_interval_minutes=(interval_minutes or candle_interval_minutes(TD_INTERVAL)),
+    )
+    return Analysis(
+        asset_key=asset_key, asset_name=cfg["name"], symbol=cfg["symbol"], price=price,
+        signal=signal, confidence=confidence, entry_low=entry_low, entry_high=entry_high,
+        sl=sl, tps=tps, atr_value=a, rsi_value=r, ema20=e20, ema50=e50,
+        macd_value=m_line, macd_signal=m_signal, macd_hist=m_hist,
+        support=support, resistance=resistance, duration_minutes=duration,
+        score=score, reasons=reasons, generated_at=datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+async def get_market_snapshot(asset_key: str) -> Tuple[Analysis, List[dict]]:
+    cfg=ASSETS[asset_key]
+    live_price=await get_price(cfg["symbol"],use_cache=False)
+    base=await get_time_series(cfg["symbol"])
+    preliminary=analyze_market(asset_key,base,live_price=live_price,interval_minutes=candle_interval_minutes(TD_INTERVAL))
+    if preliminary.signal not in ("BUY","SELL"):
+        return preliminary,base
+    d=preliminary.duration_minutes
+    if d <= 15: interval="1min"
+    elif d <= 180: interval="5min"
+    elif d <= 720: interval="15min"
+    else: interval="1h"
+    if interval == TD_INTERVAL:
+        return preliminary,base
+    try:
+        candles=await get_time_series_interval(cfg["symbol"],interval,max(300,TD_OUTPUTSIZE))
+        final=analyze_market(asset_key,candles,live_price=live_price,interval_minutes=candle_interval_minutes(interval))
+        final.reasons.append(f"MTF timeframe: {interval}")
+        return final,candles
+    except Exception as exc:
+        logger.warning("MTF %s fallback to %s: %s",asset_key,TD_INTERVAL,exc)
+        preliminary.reasons.append("MTF fallback: base timeframe")
+        return preliminary,base
 
 async def improve_analysis_with_ai(analysis: Analysis) -> str:
     prompt = f"""
@@ -702,17 +687,17 @@ class Trade:
     realized_pnl: float = 0.0
     realized_r: float = 0.0
     close_price: float = 0.0
+    closed_at: str = ""
     remaining_position_size: float = 0.0
     closed_quantity: float = 0.0
     tp_allocations: List[float] = field(default_factory=lambda: [0.10] * 10)
-    tp_realized_pnl: List[float] = field(default_factory=lambda: [0.0] * 10)
+    tp_realized_pnl: Dict[str, float] = field(default_factory=dict)
     break_even_price: float = 0.0
     trailing_stop: float = 0.0
     trailing_active: bool = False
     peak_price: float = 0.0
     expiry_at: str = ""
     expiry_reason: str = "TIME LIMIT"
-    closed_at: str = ""
 
 open_trades: Dict[str, Trade] = {}
 trade_lock = asyncio.Lock()
@@ -757,23 +742,17 @@ def load_state():
             raw.setdefault("realized_pnl", 0.0)
             raw.setdefault("realized_r", 0.0)
             raw.setdefault("close_price", 0.0)
+            raw.setdefault("closed_at", "")
             raw.setdefault("remaining_position_size", raw.get("position_size", 0.0))
             raw.setdefault("closed_quantity", 0.0)
             raw.setdefault("tp_allocations", [0.10] * 10)
-            raw.setdefault("tp_realized_pnl", [0.0] * 10)
-            raw.setdefault("break_even_price", 0.0)
+            raw.setdefault("tp_realized_pnl", {})
+            raw.setdefault("break_even_price", raw.get("entry_price", 0.0))
             raw.setdefault("trailing_stop", 0.0)
             raw.setdefault("trailing_active", False)
             raw.setdefault("peak_price", raw.get("entry_price", 0.0))
             raw.setdefault("expiry_at", "")
             raw.setdefault("expiry_reason", "TIME LIMIT")
-            if not raw.get("expiry_at") and raw.get("opened_at"):
-                try:
-                    exp, why = calculate_trade_expiry(dt_from_string(raw["opened_at"]), max(1, int(raw.get("estimated_duration_minutes", 1))), raw.get("asset_key", ""))
-                    raw["expiry_at"], raw["expiry_reason"] = exp.isoformat(), why
-                except Exception:
-                    pass
-            raw.setdefault("closed_at", "")
             # Backward compatibility: give older open trades risk metadata
             # without changing their entry/SL.
             if raw.get("status") == "OPEN" and float(raw.get("risk_amount", 0.0) or 0.0) <= 0:
@@ -911,89 +890,128 @@ def refresh_trade_risk(trade: Trade, analysis: Analysis):
     trade.rr_tp10 = abs(analysis.tps[-1] - analysis.price) / stop_distance if analysis.tps else 0.0
 
 
+def _realize_quantity(trade: Trade, price: float, quantity: float, label: str) -> float:
+    quantity = max(0.0, min(quantity, trade.remaining_position_size))
+    if quantity <= 0:
+        return 0.0
+    pnl = (price - trade.entry_price) * quantity if trade.side == "BUY" else (trade.entry_price - price) * quantity
+    trade.realized_pnl += pnl
+    trade.closed_quantity += quantity
+    trade.remaining_position_size = max(0.0, trade.remaining_position_size - quantity)
+    trade.tp_realized_pnl[label] = trade.tp_realized_pnl.get(label, 0.0) + pnl
+    return pnl
+
+
+def _activate_management(trade: Trade, price: float, atr_value: Optional[float] = None):
+    if len(trade.hit_tps) >= BREAK_EVEN_AFTER_TP and trade.break_even_price > 0:
+        if trade.side == "BUY":
+            trade.sl = max(trade.sl, trade.break_even_price)
+        else:
+            trade.sl = min(trade.sl, trade.break_even_price)
+        trade.management = "BREAK-EVEN"
+    if len(trade.hit_tps) >= TRAILING_AFTER_TP and atr_value and atr_value > 0:
+        trail = atr_value * TRAILING_ATR_MULT
+        if trade.side == "BUY":
+            trade.peak_price = max(trade.peak_price, price)
+            new_sl = trade.peak_price - trail
+            trade.sl = max(trade.sl, new_sl)
+            trade.trailing_stop = trade.sl
+        else:
+            trade.peak_price = min(trade.peak_price, price) if trade.peak_price else price
+            new_sl = trade.peak_price + trail
+            trade.sl = min(trade.sl, new_sl)
+            trade.trailing_stop = trade.sl
+        trade.trailing_active = True
+        trade.management = "TRAILING"
+
+
+def mark_trade_closed(trade: Trade, price: float, action: str, status: str = "CLOSED"):
+    price = float(price)
+    if trade.status == "OPEN" and trade.remaining_position_size > 0:
+        _realize_quantity(trade, price, trade.remaining_position_size, status)
+    trade.status = status
+    trade.management = "CLOSE"
+    trade.last_action = action
+    trade.close_price = price
+    trade.closed_at = now_local().isoformat()
+    initial_risk = max(float(trade.risk_amount), 1e-12)
+    trade.realized_r = trade.realized_pnl / initial_risk
+
+
 def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None) -> Trade:
-    now=now_local(); duration=max(MIN_TRADE_DURATION_MINUTES,min(MAX_TRADE_DURATION_MINUTES,int(analysis.duration_minutes or 1)))
-    expiry,reason=calculate_trade_expiry(now,duration,analysis.asset_key); market_close=next_market_close(analysis.asset_key,now)
-    size=float((risk or {}).get("position_size",0.0))
-    return Trade(id=uuid.uuid4().hex[:8].upper(),chat_id=chat_id,asset_key=analysis.asset_key,asset_name=analysis.asset_name,symbol=analysis.symbol,
-        side=analysis.signal,entry_low=analysis.entry_low,entry_high=analysis.entry_high,entry_price=analysis.price,sl=analysis.sl,tps=list(analysis.tps),
-        opened_at=now.isoformat(),estimated_duration_minutes=duration,next_reanalysis_at=(now+timedelta(minutes=max(1,round(duration*REANALYSIS_PERCENT)))).isoformat(),
-        market_close_at=market_close.isoformat() if market_close else "",last_price=analysis.price,score=analysis.score,confidence=analysis.confidence,
-        risk_percent=RISK_PER_TRADE_PCT,risk_amount=float((risk or {}).get("risk_amount",0.0)),position_size=size,remaining_position_size=size,
-        rr_tp1=float((risk or {}).get("rr_tp1",0.0)),rr_tp10=float((risk or {}).get("rr_tp10",0.0)),tp_allocations=list(TP_ALLOCATION),
-        tp_realized_pnl=[0.0]*10,peak_price=analysis.price,expiry_at=expiry.isoformat(),expiry_reason=reason)
+    now = now_local()
+    mins = max(1, round(analysis.duration_minutes * REANALYSIS_PERCENT))
+    expiry, expiry_reason = calculate_trade_expiry(now, analysis.duration_minutes, analysis.asset_key)
+    market_close = next_market_close(analysis.asset_key, now)
+    size = float((risk or {}).get("position_size", 0.0))
+    return Trade(
+        id=uuid.uuid4().hex[:8].upper(), chat_id=chat_id,
+        asset_key=analysis.asset_key, asset_name=analysis.asset_name, symbol=analysis.symbol,
+        side=analysis.signal, entry_low=analysis.entry_low, entry_high=analysis.entry_high,
+        entry_price=analysis.price, sl=analysis.sl, tps=list(analysis.tps),
+        opened_at=now.isoformat(), estimated_duration_minutes=analysis.duration_minutes,
+        next_reanalysis_at=(now + timedelta(minutes=mins)).isoformat(),
+        market_close_at=market_close.isoformat() if market_close else "",
+        status="OPEN", last_price=analysis.price, score=analysis.score, confidence=analysis.confidence,
+        risk_percent=RISK_PER_TRADE_PCT, risk_amount=float((risk or {}).get("risk_amount", 0.0)),
+        position_size=size, remaining_position_size=size,
+        rr_tp1=float((risk or {}).get("rr_tp1", 0.0)), rr_tp10=float((risk or {}).get("rr_tp10", 0.0)),
+        tp_allocations=list(TP_ALLOCATION), break_even_price=analysis.price, peak_price=analysis.price,
+        expiry_at=expiry.isoformat(), expiry_reason=expiry_reason,
+    )
+
 
 def trade_status_text(trade: Trade) -> str:
-    next_time=dt_from_string(trade.next_reanalysis_at).strftime("%Y-%m-%d %H:%M:%S") if trade.next_reanalysis_at else "-"
-    expiry=dt_from_string(trade.expiry_at).strftime("%Y-%m-%d %H:%M:%S") if trade.expiry_at else "-"
-    reached=", ".join(f"TP{x}" for x in trade.hit_tps) if trade.hit_tps else "none"
-    return (f"{trade.asset_name} | {trade.side} | {trade.status}\nID: {trade.id}\nEntry: {format_price(trade.entry_price)}\n"
-        f"SL: {format_price(trade.sl)}\nLast price: {format_price(trade.last_price)}\nRisk: {trade.risk_amount:.2f}$ ({trade.risk_percent:.2f}%)\n"
-        f"Position: {trade.remaining_position_size:.6f}/{trade.position_size:.6f} units\nEstimated duration: {format_duration_minutes(trade.estimated_duration_minutes)}\nRealized PnL: {trade.realized_pnl:.2f}$ ({trade.realized_r:.2f}R)\n"
-        f"R:R TP1 / TP10: {trade.rr_tp1:.2f} / {trade.rr_tp10:.2f}\nManagement: {trade.management}\nReached TP: {reached}\n"
-        f"Break-even: {format_price(trade.break_even_price) if trade.break_even_price else 'not active'}\n"
-        f"Trailing: {format_price(trade.trailing_stop) if trade.trailing_active else 'not active'}\nNext reanalysis: {next_time}\n"
-        f"Expiry: {expiry} ({trade.expiry_reason})\nMarket close: {(dt_from_string(trade.market_close_at).strftime('%Y-%m-%d %H:%M:%S') if trade.market_close_at else '24/7 / no close')}\n"
-        f"Last action: {trade.last_action}")
+    next_time = dt_from_string(trade.next_reanalysis_at).strftime("%Y-%m-%d %H:%M:%S")
+    reached = ", ".join(f"TP{x}" for x in trade.hit_tps) if trade.hit_tps else "none"
+    return (f"{trade.asset_name} | {trade.side} | {trade.status}\nID: {trade.id}\n"
+            f"Entry: {format_price(trade.entry_price)}\nSL: {format_price(trade.sl)}\n"
+            f"Last price: {format_price(trade.last_price)}\nRisk: {trade.risk_amount:.2f}$ ({trade.risk_percent:.2f}%)\n"
+            f"Initial size: {trade.position_size:.6f} | Remaining: {trade.remaining_position_size:.6f}\n"
+            f"Realized PnL: {trade.realized_pnl:.2f}$ | Realized R: {trade.realized_r:.2f}\n"
+            f"R:R TP1 / TP10: {trade.rr_tp1:.2f} / {trade.rr_tp10:.2f}\nManagement: {trade.management}\n"
+            f"Reached TP: {reached}\nNext reanalysis: {next_time}\n"
+            f"Expiry: {trade.expiry_at or '—'} ({trade.expiry_reason})\nLast action: {trade.last_action}")
+
 
 def trade_expired(trade: Trade, now: Optional[datetime] = None) -> bool:
-    if trade.status!="OPEN": return False
-    now=now or now_local()
-    if trade.expiry_at:
-        expiry=dt_from_string(trade.expiry_at); reason=trade.expiry_reason or "TIME LIMIT"
-    else:
-        expiry,reason=calculate_trade_expiry(dt_from_string(trade.opened_at),max(1,trade.estimated_duration_minutes),trade.asset_key)
-    if now>=expiry:
-        trade.last_action=f"EXPIRED - {reason}"; return True
+    if trade.status != "OPEN": return False
+    now = now or now_local()
+    opened = dt_from_string(trade.opened_at)
+    expiry, reason = calculate_trade_expiry(opened, trade.estimated_duration_minutes, trade.asset_key)
+    trade.expiry_at, trade.expiry_reason = expiry.isoformat(), reason
+    if now >= expiry:
+        trade.last_action = f"EXPIRED - {reason}"
+        return True
     return False
 
-def _pnl_for_qty(trade: Trade, entry: float, price: float, qty: float) -> float:
-    if trade.side=="BUY": return (price-entry)*qty
-    return (entry-price)*qty
 
-def _activate_management(trade: Trade, price: float, atr_value: float):
-    if BREAK_EVEN_AFTER_TP and len(trade.hit_tps) >= BREAK_EVEN_AFTER_TP and trade.remaining_position_size > 0:
-        trade.break_even_price=trade.entry_price
-        if (trade.side=="BUY" and trade.sl < trade.entry_price) or (trade.side=="SELL" and trade.sl > trade.entry_price):
-            trade.sl=trade.entry_price
-        trade.management="BREAK-EVEN"
-    if TRAILING_AFTER_TP and len(trade.hit_tps) >= TRAILING_AFTER_TP and trade.remaining_position_size > 0 and atr_value>0:
-        trail=price-atr_value*TRAILING_ATR_MULT if trade.side=="BUY" else price+atr_value*TRAILING_ATR_MULT
-        if not trade.trailing_active:
-            trade.trailing_stop=trail; trade.trailing_active=True
-        elif trade.side=="BUY": trade.trailing_stop=max(trade.trailing_stop,trail)
-        else: trade.trailing_stop=min(trade.trailing_stop,trail)
-        if trade.side=="BUY": trade.sl=max(trade.sl,trade.trailing_stop)
-        else: trade.sl=min(trade.sl,trade.trailing_stop)
-        trade.management="TRAILING"
-
-def mark_trade_closed(trade: Trade, price: float, action: str, status: str="CLOSED"):
-    if trade.status != "OPEN": return
-    if trade.remaining_position_size > 0:
-        pnl=_pnl_for_qty(trade,trade.entry_price,price,trade.remaining_position_size)
-        trade.realized_pnl += pnl; trade.closed_quantity += trade.remaining_position_size
-        trade.remaining_position_size=0.0
-    trade.status=status; trade.management="CLOSE"; trade.last_action=action; trade.close_price=float(price); trade.closed_at=now_local().isoformat()
-    trade.realized_r=(trade.realized_pnl/trade.risk_amount) if trade.risk_amount>0 else 0.0
-
-def evaluate_trade_price(trade: Trade, price: float, atr_value: float=0.0) -> List[str]:
-    events=[]; trade.last_price=float(price); trade.peak_price=max(trade.peak_price,price) if trade.side=="BUY" else min(trade.peak_price or price,price)
-    if trade.status!="OPEN": return events
-    if trade.side=="BUY" and price<=trade.sl: mark_trade_closed(trade,price,"CLOSE - SL"); return ["SL"]
-    if trade.side=="SELL" and price>=trade.sl: mark_trade_closed(trade,price,"CLOSE - SL"); return ["SL"]
+def evaluate_trade_price(trade: Trade, price: float, atr_value: Optional[float] = None) -> List[str]:
+    events=[]; trade.last_price=float(price)
+    if trade.status != "OPEN": return events
+    if trade.side == "BUY":
+        trade.peak_price=max(trade.peak_price, price)
+        if price <= trade.sl:
+            mark_trade_closed(trade, price, "CLOSE - SL"); return ["SL"]
+    else:
+        trade.peak_price=min(trade.peak_price or price, price)
+        if price >= trade.sl:
+            mark_trade_closed(trade, price, "CLOSE - SL"); return ["SL"]
     for i,tp in enumerate(trade.tps,1):
         if i in trade.hit_tps: continue
-        hit=(price>=tp) if trade.side=="BUY" else (price<=tp)
-        if not hit: continue
-        trade.hit_tps.append(i); events.append(f"TP{i}")
-        alloc=trade.tp_allocations[i-1] if i-1<len(trade.tp_allocations) else 0.10
-        qty=min(trade.remaining_position_size,trade.position_size*alloc)
-        if qty>0:
-            pnl=_pnl_for_qty(trade,trade.entry_price,tp,qty); trade.realized_pnl += pnl; trade.tp_realized_pnl[i-1]=pnl; trade.closed_quantity += qty; trade.remaining_position_size=max(0.0,trade.remaining_position_size-qty)
-        if trade.remaining_position_size <= max(1e-12,trade.position_size*0.0001):
-            mark_trade_closed(trade,price,"CLOSE - FINAL TP"); events.append("FINAL TP"); return events
-    _activate_management(trade,price,atr_value)
-    if events: trade.last_action=events[-1]+" HIT"
+        hit=(trade.side=="BUY" and price>=tp) or (trade.side=="SELL" and price<=tp)
+        if hit:
+            trade.hit_tps.append(i); alloc=trade.tp_allocations[i-1] if i-1<len(trade.tp_allocations) else 0.1
+            qty=trade.position_size*alloc
+            if i==len(trade.tps): qty=trade.remaining_position_size
+            pnl=_realize_quantity(trade, price, qty, f"TP{i}")
+            events.append(f"TP{i}")
+            trade.last_action=f"TP{i} HIT | PnL {pnl:.2f}$"
+            _activate_management(trade, price, atr_value)
+    if len(trade.hit_tps)>=len(trade.tps) or trade.remaining_position_size <= max(1e-12, trade.position_size*0.001):
+        trade.remaining_position_size=0.0
+        trade.realized_r=trade.realized_pnl/max(trade.risk_amount,1e-12)
+        trade.status="CLOSED"; trade.management="CLOSE"; trade.last_action="CLOSE - FINAL TP"; trade.close_price=price; trade.closed_at=now_local().isoformat(); events.append("FINAL TP")
     return events
 
 # ============================================================
@@ -1026,27 +1044,17 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
         trade.management = "ADJUST"
         trade.last_action = "ADJUST - DIRECTION CHANGED"
         # Apply the new technical plan instead of merely reporting it.
-        remaining_fraction = (trade.remaining_position_size / trade.position_size) if trade.position_size > 0 else 1.0
         trade.side = analysis.signal
         trade.entry_low = analysis.entry_low
         trade.entry_high = analysis.entry_high
         trade.entry_price = analysis.price
         trade.sl = analysis.sl
         trade.tps = analysis.tps
-        trade.hit_tps = []
         trade.notified_tps = []
-        trade.closed_quantity = 0.0
-        trade.tp_realized_pnl = [0.0] * 10
         trade.estimated_duration_minutes = max(1, analysis.duration_minutes)
         refresh_trade_risk(trade, analysis)
-        trade.remaining_position_size = trade.position_size * max(0.0, min(1.0, remaining_fraction))
-        trade.closed_quantity = trade.position_size - trade.remaining_position_size
-        trade.break_even_price = 0.0
-        trade.trailing_stop = 0.0
-        trade.trailing_active = False
         close_at = next_market_close(trade.asset_key, now)
         trade.market_close_at = close_at.isoformat() if close_at else ""
-        trade.expiry_at, trade.expiry_reason = (lambda x: (x[0].isoformat(), x[1]))(calculate_trade_expiry(now, trade.estimated_duration_minutes, trade.asset_key))
 
     trade.last_price = analysis.price
     trade.score = analysis.score
@@ -1059,24 +1067,9 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
 # ============================================================
 # ASSET COMMANDS
 # ============================================================
-async def market_quality_gate(analysis: Analysis) -> Tuple[bool, str]:
-    """Optional spread/quality protection. If quote fields are unavailable, do not invent a spread."""
-    if MAX_SPREAD_ATR_RATIO <= 0 or analysis.atr_value <= 0:
-        return True, "quality checks disabled"
-    try:
-        data = await td_get("quote", {"symbol": analysis.symbol, "format": "JSON"})
-        bid = float(data.get("bid")); ask = float(data.get("ask"))
-        spread = max(0.0, ask-bid)
-        if spread > analysis.atr_value * MAX_SPREAD_ATR_RATIO:
-            return False, f"السبريد {spread:.6f} أكبر من {MAX_SPREAD_ATR_RATIO:.2f}×ATR ({analysis.atr_value:.6f})."
-    except Exception:
-        # Twelve Data does not expose bid/ask for every instrument/data plan.
-        return True, "spread unavailable; not used"
-    return True, "OK"
-
 async def perform_asset_analysis(message: types.Message, asset_key: str, create_new_trade: bool = True):
     if not get_twelve_data_api_key():
-        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير متاح داخل عملية البوت.")
+        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير موجود في Render Environment.")
         return
     cfg = ASSETS[asset_key]
     await safe_send(message, f"🔄 جاري جلب السعر الحي والبيانات وتحليل {cfg['name']}...")
@@ -1098,10 +1091,6 @@ async def perform_asset_analysis(message: types.Message, asset_key: str, create_
             if len([t for t in open_trades.values() if t.status == "OPEN"]) >= MAX_OPEN_TRADES:
                 await safe_send(message, "⚠️ تم الوصول إلى الحد الأقصى للصفقات المفتوحة.")
                 return
-            quality_ok, quality_reason = await market_quality_gate(analysis)
-            if not quality_ok:
-                await safe_send(message, analysis_message(analysis, ai_note) + f"\n\n🛡️ لم تُفتح الصفقة بسبب جودة السوق: {quality_reason}")
-                return
             allowed, risk_reason, risk = risk_gate(analysis)
             if not allowed:
                 await safe_send(message, analysis_message(analysis, ai_note) + f"\n\n🛡️ لم تُفتح الصفقة بسبب إدارة المخاطر: {risk_reason}")
@@ -1122,20 +1111,187 @@ async def perform_asset_analysis(message: types.Message, asset_key: str, create_
         await safe_send(message, text)
 
 # ============================================================
+# BUTTON-BASED TELEGRAM UI
+# ============================================================
+def main_keyboard():
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🥇 Gold",callback_data="asset:gold"),types.InlineKeyboardButton(text="₿ BTC",callback_data="asset:btc")],
+        [types.InlineKeyboardButton(text="💶 EUR/USD",callback_data="asset:eurusd"),types.InlineKeyboardButton(text="🥈 Silver",callback_data="asset:silver")],
+        [types.InlineKeyboardButton(text="🛢 Oil",callback_data="asset:oil"),types.InlineKeyboardButton(text="Ξ ETH",callback_data="asset:eth")],
+        [types.InlineKeyboardButton(text="📋 Open Trades",callback_data="trades"),types.InlineKeyboardButton(text="⚙️ Status",callback_data="status")],
+        [types.InlineKeyboardButton(text="🛡 Risk",callback_data="risk"),types.InlineKeyboardButton(text="🧠 Strategies",callback_data="strategies")],
+        [types.InlineKeyboardButton(text="🧪 Training",callback_data="training"),types.InlineKeyboardButton(text="🏆 Ranking",callback_data="ranking")],
+        [types.InlineKeyboardButton(text="📊 Backtest",callback_data="backtest"),types.InlineKeyboardButton(text="📅 Performance",callback_data="performance")],
+        [types.InlineKeyboardButton(text="📰 News",callback_data="news_help"),types.InlineKeyboardButton(text="🎥 Video",callback_data="video_help")],
+        [types.InlineKeyboardButton(text="🔄 Refresh",callback_data="menu")],
+    ])
+
+def trade_keyboard(trade: Trade):
+    return types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🔄 Reanalyze",callback_data=f"reanalyze:{trade.id}"),types.InlineKeyboardButton(text="❌ Close",callback_data=f"close:{trade.id}")],
+        [types.InlineKeyboardButton(text="⬅️ Trades",callback_data="trades"),types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]
+    ])
+
+async def send_menu(chat_id:int):
+    await bot.send_message(chat_id,"👑 Trading Bot\n\nتحكم كامل من الأزرار.\n\nاختر العملية:",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "menu")
+async def cb_menu(call: types.CallbackQuery):
+    await call.answer(); await call.message.edit_text("👑 Trading Bot\n\nتحكم كامل من الأزرار.\n\nاختر العملية:",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data.startswith("asset:"))
+async def cb_asset(call: types.CallbackQuery):
+    await call.answer("جاري التحليل...")
+    asset=call.data.split(":",1)[1]
+    if asset not in ASSETS: return
+    try:
+        analysis,_=await get_market_snapshot(asset); ai=await improve_analysis_with_ai(analysis)
+        text=analysis_message(analysis,ai)
+        buttons=[[types.InlineKeyboardButton(text="🟢 فتح صفقة ورقية",callback_data=f"open:{asset}")]] if analysis.signal in ("BUY","SELL") and analysis.confidence>=MIN_CONFIDENCE_TO_OPEN else []
+        buttons += [[types.InlineKeyboardButton(text="🔄 إعادة التحليل",callback_data=f"asset:{asset}")],[types.InlineKeyboardButton(text="⬅️ Home",callback_data="menu")]]
+        await call.message.edit_text(text,reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    except Exception as exc:
+        await call.message.edit_text(f"❌ فشل التحليل: {str(exc)[:700]}",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data.startswith("open:"))
+async def cb_open(call: types.CallbackQuery):
+    await call.answer("فتح الصفقة...")
+    asset=call.data.split(":",1)[1]
+    if asset not in ASSETS: return
+    try:
+        analysis,_=await get_market_snapshot(asset)
+        if analysis.signal not in ("BUY","SELL") or analysis.confidence<MIN_CONFIDENCE_TO_OPEN:
+            await call.message.edit_text("⚠️ لم تعد الإشارة مؤهلة لفتح صفقة.",reply_markup=main_keyboard()); return
+        async with trade_lock:
+            if any(t.asset_key==asset and t.status=="OPEN" for t in open_trades.values()):
+                await call.message.edit_text("⚠️ توجد صفقة مفتوحة لهذا الأصل بالفعل.",reply_markup=main_keyboard()); return
+            if sum(t.status=="OPEN" for t in open_trades.values())>=MAX_OPEN_TRADES:
+                await call.message.edit_text("⚠️ تم الوصول إلى الحد الأقصى للصفقات المفتوحة.",reply_markup=main_keyboard()); return
+            ok,reason,risk=risk_gate(analysis)
+            if not ok:
+                await call.message.edit_text(f"🛡️ لم تُفتح الصفقة بسبب إدارة المخاطر:\n{reason}",reply_markup=main_keyboard()); return
+            trade=create_trade(call.message.chat.id,analysis,risk); open_trades[trade.id]=trade; save_state()
+        await call.message.edit_text(trade_status_text(trade),reply_markup=trade_keyboard(trade))
+    except Exception as exc:
+        await call.message.edit_text(f"❌ فشل فتح الصفقة: {str(exc)[:700]}",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "status")
+async def cb_status(call: types.CallbackQuery):
+    await call.answer(); open_count=sum(t.status=="OPEN" for t in open_trades.values())
+    text=(f"⚙️ Status\n\nTelegram: ONLINE\nTwelve Data: {'CONFIGURED' if get_twelve_data_api_key() else 'MISSING'}\nGemini keys: {len(GEMINI_KEYS)}\nOpen trades: {open_count}/{MAX_OPEN_TRADES}\nRisk/trade: {RISK_PER_TRADE_PCT:.2f}%\nOpen risk: {current_open_risk():.2f}$\nDaily exposure: {daily_risk_exposure():.2f}$\nMonitor: {MONITOR_SECONDS}s\nDuration: {MIN_TRADE_DURATION_MINUTES}m → {MAX_TRADE_DURATION_MINUTES}m\nTraining minimum: {STRATEGY_MIN_TRADES} actual trades")
+    await call.message.edit_text(text,reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "risk")
+async def cb_risk(call: types.CallbackQuery):
+    await call.answer(); await call.message.edit_text(f"🛡 Risk\n\nBalance: {ACCOUNT_BALANCE:.2f}$\nRisk/trade: {RISK_PER_TRADE_PCT:.2f}%\nOpen risk: {current_open_risk():.2f}$ / {ACCOUNT_BALANCE*MAX_TOTAL_OPEN_RISK_PCT/100:.2f}$\nDaily: {daily_risk_exposure():.2f}$ / {ACCOUNT_BALANCE*DAILY_RISK_LIMIT_PCT/100:.2f}$",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "trades")
+async def cb_trades(call: types.CallbackQuery):
+    await call.answer(); trades=[t for t in open_trades.values() if t.status=="OPEN"]
+    if not trades: await call.message.edit_text("📋 لا توجد صفقات مفتوحة.",reply_markup=main_keyboard()); return
+    kb=[]
+    for t in trades: kb.append([types.InlineKeyboardButton(text=f"{t.asset_name} {t.side} • {t.id}",callback_data=f"trade:{t.id}")])
+    kb.append([types.InlineKeyboardButton(text="⚠️ Close ALL",callback_data="close_all_confirm")]); kb.append([types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]); await call.message.edit_text("📋 الصفقات المفتوحة",reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("trade:"))
+async def cb_trade(call: types.CallbackQuery):
+    await call.answer(); tid=call.data.split(":",1)[1]; t=open_trades.get(tid)
+    if not t: await call.message.edit_text("❌ الصفقة غير موجودة",reply_markup=main_keyboard()); return
+    await call.message.edit_text(trade_status_text(t),reply_markup=trade_keyboard(t))
+
+@dp.callback_query(F.data.startswith("reanalyze:"))
+async def cb_reanalyze(call: types.CallbackQuery):
+    await call.answer("إعادة التحليل..."); tid=call.data.split(":",1)[1]; t=open_trades.get(tid)
+    if not t or t.status!="OPEN": await call.message.edit_text("❌ الصفقة غير مفتوحة",reply_markup=main_keyboard()); return
+    try:
+        t,a,e=await reanalyze_trade(t,"button"); await call.message.edit_text(trade_status_text(t)+"\n\nEvents: "+(", ".join(e) or "none"),reply_markup=trade_keyboard(t) if t.status=="OPEN" else main_keyboard())
+    except Exception as exc: await call.message.edit_text(f"❌ {str(exc)[:700]}",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data.startswith("close:"))
+async def cb_close(call: types.CallbackQuery):
+    await call.answer(); tid=call.data.split(":",1)[1]; t=open_trades.get(tid)
+    if not t or t.status!="OPEN": await call.message.edit_text("❌ الصفقة غير مفتوحة",reply_markup=main_keyboard()); return
+    mark_trade_closed(t,t.last_price,"CLOSE - USER"); save_state(); await call.message.edit_text(trade_status_text(t),reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "strategies")
+async def cb_strategies(call: types.CallbackQuery):
+    await call.answer(); rows=top_strategies(10)
+    if not rows:
+        await call.message.edit_text("🧠 لا توجد استراتيجيات مدربة بعد.\n\nأرسل رابط فيديو للاستراتيجية.",reply_markup=main_keyboard()); return
+    text="🏆 أفضل الاستراتيجيات\n\n"; kb=[]
+    for i,(st,r) in enumerate(rows,1):
+        text+=f"{i}. {st.name}\nScore {r.score} | OOS {r.oos_score} | WR {r.win_rate}% | Trades {r.trades} | {r.verdict}\n\n"
+        kb.append([types.InlineKeyboardButton(text=f"🔎 {i}. {st.name[:28]}",callback_data=f"strategy:{st.id}"),types.InlineKeyboardButton(text="🔄 Retrain",callback_data=f"retrain:{st.id}")])
+    kb.append([types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]); await call.message.edit_text(text,reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("strategy:"))
+async def cb_strategy_detail(call: types.CallbackQuery):
+    await call.answer(); sid=call.data.split(":",1)[1]; st=strategy_from_db(sid)
+    if not st: await call.message.edit_text("❌ الاستراتيجية غير موجودة",reply_markup=main_keyboard()); return
+    kb=[[types.InlineKeyboardButton(text="🔄 Retrain",callback_data=f"retrain:{sid}")],[types.InlineKeyboardButton(text="⬅️ Ranking",callback_data="ranking")],[types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]]
+    await call.message.edit_text(strategy_display(st,result_from_db(sid)),reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("retrain:"))
+async def cb_retrain(call: types.CallbackQuery):
+    await call.answer("بدء إعادة التدريب...")
+    sid=call.data.split(":",1)[1]; st=strategy_from_db(sid)
+    if not st: await call.message.edit_text("❌ الاستراتيجية غير موجودة",reply_markup=main_keyboard()); return
+    if training_status["running"]: await call.message.edit_text("⚠️ يوجد تدريب جارٍ بالفعل.",reply_markup=main_keyboard()); return
+    await call.message.edit_text(f"🧪 إعادة تدريب {st.name}...\nسيتم اختبار ≥{STRATEGY_MIN_TRADES} صفقة فعلية في منطقة التدريب ثم OOS.")
+    try:
+        r=await train_strategy(st); await call.message.edit_text(strategy_display(st,r),reply_markup=main_keyboard())
+    except Exception as exc: await call.message.edit_text(f"❌ فشل التدريب: {str(exc)[:700]}",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "training")
+async def cb_training(call: types.CallbackQuery):
+    await call.answer(); await call.message.edit_text(f"🧪 Training\n\nRunning: {training_status['running']}\nStrategy: {training_status['strategy_name'] or '—'}\nTests: {training_status['tests']}\nActual trades: {training_status['trades']}\nMinimum required: {STRATEGY_MIN_TRADES}\nStatus: {training_status['message']}",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "ranking")
+async def cb_ranking(call: types.CallbackQuery):
+    await cb_strategies(call)
+
+@dp.callback_query(F.data == "backtest")
+async def cb_backtest(call: types.CallbackQuery):
+    await call.answer("جاري Backtest...")
+    if not get_twelve_data_api_key(): await call.message.edit_text("❌ Twelve Data غير مهيأ.",reply_markup=main_keyboard()); return
+    lines=["📊 Backtest"]
+    for _,cfg in ASSETS.items():
+        try:
+            r=backtest_ema_rsi(await get_time_series(cfg["symbol"],500)); lines.append(f"\n{cfg['name']}\nTrades {r['trades']} | WR {r['win_rate']}% | Net R {r['net_r']} | DD {r['max_drawdown_r']}")
+        except Exception as exc: lines.append(f"\n{cfg['name']}: ERROR {str(exc)[:120]}")
+    lines.append("\n⚠️ تاريخي وليس ضمانًا للأداء المستقبلي."); await call.message.edit_text("".join(lines),reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "performance")
+async def cb_performance(call: types.CallbackQuery):
+    await call.answer(); closed=[t for t in open_trades.values() if t.status!="OPEN"]
+    wins=sum(t.realized_pnl>0 for t in closed); losses=sum(t.realized_pnl<0 for t in closed); pnl=sum(t.realized_pnl for t in closed)
+    await call.message.edit_text(f"📅 Performance\n\nClosed trades: {len(closed)}\nWins: {wins}\nLosses: {losses}\nWin rate: {(wins/len(closed)*100 if closed else 0):.2f}%\nRealized PnL: {pnl:.2f}$\nOpen trades: {sum(t.status=='OPEN' for t in open_trades.values())}",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "close_all_confirm")
+async def cb_close_all_confirm(call: types.CallbackQuery):
+    await call.answer(); await call.message.edit_text("⚠️ هل تريد إغلاق جميع الصفقات المفتوحة؟",reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="❌ نعم، أغلق الكل",callback_data="close_all")],[types.InlineKeyboardButton(text="↩️ إلغاء",callback_data="trades")]]))
+
+@dp.callback_query(F.data == "close_all")
+async def cb_close_all(call: types.CallbackQuery):
+    await call.answer(); count=0
+    for t in open_trades.values():
+        if t.status=="OPEN": mark_trade_closed(t,t.last_price,"CLOSE ALL - USER"); count+=1
+    save_state(); await call.message.edit_text(f"تم إغلاق {count} صفقة.",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "news_help")
+async def cb_news(call: types.CallbackQuery):
+    await call.answer(); await call.message.edit_text("📰 تحليل الأخبار\n\nأرسل خبرًا أو أعد توجيهه إلى البوت. سيتم تحليل الأصول والاتجاه والقوة والأفق، ثم حفظ التوقع وقياس النتيجة لاحقًا للتعلم.",reply_markup=main_keyboard())
+
+@dp.callback_query(F.data == "video_help")
+async def cb_video(call: types.CallbackQuery):
+    await call.answer(); await call.message.edit_text("🎥 تحليل الاستراتيجيات من الفيديو\n\nأرسل رابط YouTube/Vimeo/Dailymotion/TikTok/Instagram/Facebook. إذا لم توجد ترجمة، سيُنزل البوت الفيديو ويحلله بصريًا وصوتيًا عبر Gemini لاستخراج الشموع والمؤشرات وقواعد الدخول/الخروج، ثم يحولها إلى استراتيجية قابلة للاختبار والتدريب ≥70 صفقة فعلية + OOS + ترتيب.",reply_markup=main_keyboard())
+
+# ============================================================
 # COMMANDS
 # ============================================================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await safe_send(message,
-        "👑 مرحبًا بك في Trading Bot\n\n"
-        "📈 التحليل الحي:\n/gold\n/btc\n/eurusd\n/silver\n/oil\n/eth\n\n"
-        "📌 إدارة الصفقات:\n/trades\n/close ALL\n/close TRADE_ID\n/reanalyze TRADE_ID\n/status\n/risk\n\n"
-        "🧪 الاختبار والتعلم:\n/auto_backtest\n/weekly_table\n/strategies\n/strategy STRATEGY_ID\n/training\n/retrain STRATEGY_ID\n\n"
-        "🎥 أرسل رابط فيديو للاستراتيجية؛ سيُستخرج النص المتاح ويُختبر تاريخيًا في منطقة التدريب فقط.\n"
-        "📰 أرسل أو أعد توجيه خبر إلى البوت لتحليل تأثيره.\n\n"
-        "⏰ حماية إغلاق السوق مفعلة: الصفقة تنتهي تلقائيًا قبل وقت الإغلاق المحدد للسوق. Crypto يعمل 24/7.\n\n"
-        "⚠️ لا يوجد ضمان للربح."
-    )
+    await message.answer("👑 مرحبًا بك في Trading Bot\n\nتحكم كامل عبر الأزرار:", reply_markup=main_keyboard())
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
@@ -1325,51 +1481,55 @@ async def cmd_retrain(message: types.Message):
 # BACKTEST
 # ============================================================
 def backtest_ema_rsi(candles: List[dict]) -> dict:
-    """Baseline backtest using the same directional logic and 10-TP management."""
-    if len(candles)<140: return {"trades":0,"wins":0,"losses":0,"win_rate":0,"profit_factor":0,"net_r":0,"max_drawdown_r":0,"expectancy_r":0,"sharpe_like":0,"note":"Not enough historical candles."}
-    results=[]; durations=[]; i=60
-    while i < len(candles)-12:
+    if len(candles) < 160:
+        return {"trades":0,"wins":0,"losses":0,"win_rate":0,"net_r":0,"max_drawdown_r":0,"expectancy_r":0,"note":"Not enough historical candles."}
+    r_values=[]; i=60; stride=1
+    while i < len(candles)-15:
         c=[x["close"] for x in candles[:i+1]]; h=[x["high"] for x in candles[:i+1]]; l=[x["low"] for x in candles[:i+1]]
         e20,e50,rr,aa=ema(c,20),ema(c,50),rsi(c,14),atr(h,l,c,14)
-        if None in (e20,e50,rr,aa) or aa<=0: i+=1; continue
-        price=c[-1]
-        side="BUY" if price>e20>e50 and rr>55 else "SELL" if price<e20<e50 and rr<45 else None
-        if not side: i+=1; continue
+        if None in (e20,e50,rr,aa) or aa<=0: i+=stride; continue
+        price=c[-1]; side="BUY" if price>e20>e50 and rr>55 else "SELL" if price<e20<e50 and rr<45 else None
+        if not side: i+=stride; continue
         sl=price-aa*1.2 if side=="BUY" else price+aa*1.2
-        tps=[price+aa*x for x in (0.8,1.2,1.6,2.0,2.4,2.8,3.2,3.6,4.0,4.5)] if side=="BUY" else [price-aa*x for x in (0.8,1.2,1.6,2.0,2.4,2.8,3.2,3.6,4.0,4.5)]
-        remaining=1.0; realized=0.0; hit=[]; trail=sl; be=False; exit_j=None
-        for j in range(i+1,min(i+1+max(12,72),len(candles))):
+        tps=[price+aa*x for x in (0.8,1.2,1.6,2,2.4,2.8,3.2,3.6,4,4.5)] if side=="BUY" else [price-aa*x for x in (0.8,1.2,1.6,2,2.4,2.8,3.2,3.6,4,4.5)]
+        remaining=1.0; realized=0.0; hit=set(); peak=price; trail=None; result=None
+        for j in range(i+1,min(len(candles),i+1+max(10,int(analysis_duration_for_backtest(aa))))):
             bar=candles[j]
-            # Conservative OHLC assumption: SL first when SL and TP are both touched.
-            if side=="BUY" and bar["low"]<=trail:
-                realized += remaining*((trail-price)/aa); exit_j=j; break
-            if side=="SELL" and bar["high"]>=trail:
-                realized += remaining*((price-trail)/aa); exit_j=j; break
+            # Conservative intrabar ordering: SL before TP.
+            if side=="BUY":
+                peak=max(peak,bar["high"])
+                active_sl=max(sl,trail) if trail is not None else sl
+                if bar["low"]<=active_sl: result=realized-remaining; break
+            else:
+                peak=min(peak,bar["low"])
+                active_sl=min(sl,trail) if trail is not None else sl
+                if bar["high"]>=active_sl: result=realized-remaining; break
             for n,tp in enumerate(tps,1):
                 if n in hit: continue
-                touched=(bar["high"]>=tp) if side=="BUY" else (bar["low"]<=tp)
+                touched=(bar["high"]>=tp if side=="BUY" else bar["low"]<=tp)
                 if touched:
-                    alloc=0.10; realized += alloc*((tp-price)/aa if side=="BUY" else (price-tp)/aa); remaining-=alloc; hit.append(n)
-                    if len(hit)>=BREAK_EVEN_AFTER_TP and not be:
-                        trail=price; be=True
-                    if len(hit)>=TRAILING_AFTER_TP:
-                        candidate=bar["close"]-aa*TRAILING_ATR_MULT if side=="BUY" else bar["close"]+aa*TRAILING_ATR_MULT
-                        trail=max(trail,candidate) if side=="BUY" else min(trail,candidate)
-                    if remaining<=1e-9: exit_j=j; break
-            if exit_j is not None: break
-        if exit_j is None:
-            exit_j=min(len(candles)-1,i+72); exit_price=candles[exit_j]["close"]; realized += remaining*((exit_price-price)/aa if side=="BUY" else (price-exit_price)/aa)
-        results.append(realized); durations.append(max(1,(exit_j or i)-i)); i += max(1,(exit_j or i)-i)
-    trades=[r for r in results if r!=0]; wins=[r for r in trades if r>0]; losses=[r for r in trades if r<0]; gp=sum(wins); gl=abs(sum(losses)); pf=gp/gl if gl else (99.0 if gp else 0.0); net=sum(trades); wr=len(wins)/len(trades)*100 if trades else 0; exp=net/len(trades) if trades else 0
-    eq=peak=dd=0.0
-    for r in results: eq+=r; peak=max(peak,eq); dd=max(dd,peak-eq)
-    _,_,_,_,sh=_series_metrics(results)
-    return {"trades":len(trades),"wins":len(wins),"losses":len(losses),"win_rate":round(wr,2),"profit_factor":round(pf,3),"net_r":round(net,3),"max_drawdown_r":round(dd,3),"expectancy_r":round(exp,4),"sharpe_like":round(sh,4),"avg_duration_bars":round(sum(durations)/len(durations),2) if durations else 0,"note":"Walk-forward-style historical simulation with 10 TP allocations, break-even and trailing management. Conservative SL-first OHLC assumption."}
+                    alloc=TP_ALLOCATION[n-1] if n-1<len(TP_ALLOCATION) else .1
+                    alloc=min(alloc,remaining); r=(abs(tp-price)/(aa*1.2))*alloc
+                    realized += r; remaining=max(0.0,remaining-alloc); hit.add(n)
+                    if n>=BREAK_EVEN_AFTER_TP: sl=max(sl,price) if side=="BUY" else min(sl,price)
+                    if n>=TRAILING_AFTER_TP:
+                        dist=aa*TRAILING_ATR_MULT; trail=(peak-dist if side=="BUY" else peak+dist)
+                        sl=max(sl,trail) if side=="BUY" else min(sl,trail)
+                    if n==10 or remaining<=1e-9: result=realized; remaining=0; break
+            if result is not None: break
+        if result is None: result=realized-remaining
+        r_values.append(result); i += 10
+    m=_metrics_for_values(r_values)
+    return {"trades":m["trades"],"wins":m["wins"],"losses":m["losses"],"win_rate":round(m["win_rate"],2),"net_r":round(m["net_r"],3),"max_drawdown_r":round(m["dd"],3),"expectancy_r":round(m["expectancy"],4),"note":"Walk-forward paper simulation with TP1-TP10, partial exits, break-even and trailing; conservative SL-first on ambiguous OHLC bars."}
+
+def analysis_duration_for_backtest(atr_value: float) -> int:
+    # Fixed 10-bar minimum for the EMA/RSI benchmark; strategy-specific tests use max_hold_bars.
+    return 10
 
 @dp.message(Command("auto_backtest"))
 async def cmd_auto_backtest(message: types.Message):
     if not get_twelve_data_api_key():
-        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير متاح للعملية الحالية.")
+        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير موجود، لذلك لا يمكن تنفيذ Backtest حقيقي.")
         return
     await safe_send(message, "🧪 جاري تنفيذ Backtest حقيقي من البيانات التاريخية المتاحة...")
     results = []
@@ -1381,13 +1541,13 @@ async def cmd_auto_backtest(message: types.Message):
         results.append((cfg["name"], result))
     text = "🧪 نتائج Backtest الحقيقي\n\n"
     for name, r in results:
-        text += f"{name}\nTrades: {r['trades']}\nWins: {r['wins']}\nLosses: {r['losses']}\nWin rate: {r['win_rate']}%\nPF: {r.get('profit_factor',0)} | Net R: {r.get('net_r',0)}\nMax DD: {r.get('max_drawdown_r',0)}R | Expectancy: {r.get('expectancy_r',0)}R\nSharpe-like: {r.get('sharpe_like',0)}\nAvg duration: {r.get('avg_duration_bars',0)} bars\nNote: {r['note']}\n\n"
+        text += f"{name}\nTrades: {r['trades']}\nWins: {r['wins']}\nLosses: {r['losses']}\nWin rate: {r['win_rate']}%\nNote: {r['note']}\n\n"
     await safe_send(message, text + "⚠️ الاختبار تاريخي وليس ضمانًا للنتائج المستقبلية.")
 
 @dp.message(Command("weekly_table"))
 async def cmd_weekly_table(message: types.Message):
     if not get_twelve_data_api_key():
-        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير متاح للعملية الحالية."); return
+        await safe_send(message, "❌ TWELVE_DATA_API_KEY غير موجود."); return
     rows=[]
     for _,cfg in ASSETS.items():
         try:
@@ -1437,71 +1597,17 @@ class StrategyResult:
     trained_at: str
     assets_tested: int = 0
     r_values: List[float] = field(default_factory=list)
+    training_trades: int = 0
+    oos_tests: int = 0
     oos_trades: int = 0
     oos_win_rate: float = 0.0
-    oos_profit_factor: float = 0.0
     oos_net_r: float = 0.0
-    sharpe_like: float = 0.0
+    oos_expectancy_r: float = 0.0
+    oos_score: float = 0.0
 
 
 strategies_db: Dict[str, dict] = {"strategies": {}, "results": {}}
 strategy_db_lock = asyncio.Lock()
-
-news_learning: Dict[str, dict] = {"records": {}}
-news_lock = asyncio.Lock()
-
-def load_news_learning():
-    global news_learning
-    if not os.path.exists(NEWS_DB_FILE): return
-    try:
-        with open(NEWS_DB_FILE,"r",encoding="utf-8") as f: data=json.load(f)
-        if isinstance(data,dict): news_learning={"records":data.get("records",{})}
-    except Exception: logger.exception("Could not load news learning")
-
-def save_news_learning():
-    try:
-        tmp=NEWS_DB_FILE+".tmp"
-        with open(tmp,"w",encoding="utf-8") as f: json.dump(news_learning,f,ensure_ascii=False,indent=2)
-        os.replace(tmp,NEWS_DB_FILE)
-    except Exception: logger.exception("Could not save news learning")
-
-def _parse_news_json(text: str) -> Optional[dict]:
-    data=extract_json_from_ai(text)
-    if not data: return None
-    assets=[a for a in data.get("assets",[]) if a in ASSETS]
-    direction=str(data.get("direction","unknown")).lower()
-    if direction not in ("bullish","bearish","mixed","unknown"): direction="unknown"
-    try: strength=max(1,min(5,int(data.get("strength",0))))
-    except Exception: strength=0
-    try: horizon=max(1,min(4320,int(data.get("horizon_minutes",NEWS_EVAL_MINUTES_DEFAULT))))
-    except Exception: horizon=NEWS_EVAL_MINUTES_DEFAULT
-    return {"assets":assets,"direction":direction,"strength":strength,"horizon_minutes":horizon,"summary":str(data.get("summary", ""))[:1000]}
-
-async def evaluate_news_learning():
-    due=[]; now=now_local()
-    for rid,rec in list(news_learning.get("records",{}).items()):
-        if rec.get("evaluated") or not rec.get("due_at"): continue
-        try:
-            if dt_from_string(rec["due_at"])<=now: due.append((rid,rec))
-        except Exception: continue
-    changed=False
-    for rid,rec in due:
-        assets=rec.get("assets",[])
-        outcomes=[]
-        for asset in assets:
-            try:
-                current=await get_price(ASSETS[asset]["symbol"],use_cache=False)
-                start=float(rec.get("prices",{}).get(asset,0));
-                if start<=0: continue
-                move=current-start
-                actual="bullish" if move>0 else "bearish" if move<0 else "flat"
-                predicted=rec.get("direction","unknown")
-                correct=(predicted==actual) if predicted in ("bullish","bearish") else None
-                outcomes.append({"asset":asset,"start":start,"end":current,"move":move,"actual":actual,"correct":correct})
-            except Exception as exc: logger.warning("News outcome failed %s/%s: %s",rid,asset,exc)
-        rec["outcomes"]=outcomes; rec["evaluated"]=True; rec["evaluated_at"]=now.isoformat(); changed=True
-    if changed: save_news_learning()
-
 
 
 def load_strategies():
@@ -1574,8 +1680,9 @@ def clean_vtt_text(raw: str) -> str:
 
 async def extract_video_text(url: str) -> str:
     """
-    Extracts available subtitles only. It never claims that the video was watched.
-    If subtitles are unavailable, returns an empty string.
+    Extract available subtitles when the platform exposes them.
+    This is only the fast text path; when subtitles are missing,
+    process_strategy_video() falls back to Gemini visual/audio video understanding.
     """
     if not shutil.which(sys.executable):
         return ""
@@ -1629,6 +1736,129 @@ async def extract_video_text(url: str) -> str:
                 seen.add(key)
                 unique.append(part)
         return "\n".join(unique)[:30000]
+
+
+def _download_video_for_ai(url: str, tmp_dir: str) -> Optional[str]:
+    """Download a public video with yt-dlp for Gemini multimodal analysis.
+
+    We deliberately avoid requiring subtitles: the downloaded media contains the
+    visual frames and audio track, which Gemini can inspect directly.
+    """
+    output_template = str(Path(tmp_dir) / "video.%(ext)s")
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-warnings", "--quiet",
+        "--no-playlist",
+        "--max-filesize", os.getenv("VIDEO_MAX_DOWNLOAD", "500M"),
+        "-f", "best[ext=mp4]/best",
+        "-o", output_template,
+        url,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=int(os.getenv("VIDEO_DOWNLOAD_TIMEOUT", "600"))
+        )
+    except Exception as exc:
+        logger.warning("Video download failed: %s", exc)
+        return None
+    if proc.returncode != 0:
+        logger.warning("yt-dlp video download failed: %s", (proc.stderr or "")[-1000:])
+        return None
+    files = [x for x in Path(tmp_dir).glob("video.*") if x.is_file()]
+    if not files:
+        return None
+    return str(files[0])
+
+
+def _gemini_video_analyze_sync(video_path: str, prompt: str, key: str, models: List[str]) -> str:
+    """Synchronous Gemini Files API video analysis, executed in a worker thread."""
+    if genai is None or not key:
+        return ""
+    client = genai.Client(api_key=key)
+    uploaded = client.files.upload(file=video_path)
+    # Video files may need server-side processing before they can be queried.
+    deadline = time.monotonic() + float(os.getenv("VIDEO_PROCESSING_TIMEOUT", "900"))
+    while True:
+        state = getattr(uploaded, "state", None)
+        state_name = getattr(state, "name", str(state or "")).upper()
+        if state_name == "ACTIVE":
+            break
+        if state_name in {"FAILED", "ERROR"}:
+            raise RuntimeError(f"Gemini video processing failed: {state_name}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Gemini video processing timeout")
+        time.sleep(3)
+        uploaded = client.files.get(name=uploaded.name)
+
+    last_error = ""
+    for model in models:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[uploaded, prompt],
+            )
+            text = getattr(response, "text", None)
+            if text:
+                return text.strip()
+        except Exception as exc:
+            last_error = str(exc)
+            low = last_error.lower()
+            if any(x in low for x in ("not found", "404", "unsupported", "does not exist", "invalid model")):
+                continue
+            raise
+    if last_error:
+        raise RuntimeError(last_error)
+    return ""
+
+
+async def analyze_video_visually(url: str) -> str:
+    """
+    Full multimodal fallback for videos without subtitles.
+
+    Gemini receives the actual video, so it can inspect frames, charts, on-screen
+    indicators, spoken audio and temporal order instead of relying on captions.
+    """
+    if genai is None or not GEMINI_KEYS:
+        return ""
+    with tempfile.TemporaryDirectory(prefix="strategy_video_media_") as tmp:
+        video_path = await asyncio.to_thread(_download_video_for_ai, url, tmp)
+        if not video_path:
+            return ""
+        prompt = """
+أنت محلل فيديو متخصص في استخراج استراتيجيات التداول. حلّل الفيديو نفسه بصريًا وزمنيًا
+وصوتيًا، ولا تعتمد على وجود ترجمة. إذا كان هناك كلام مسموع فاستخرج مضمونه المفيد،
+وإذا ظهرت شاشات تداول/شموع/مؤشرات/رسوم فحللها بصريًا. ابحث تحديدًا عن:
+
+1) اسم أو فكرة الاستراتيجية.
+2) شروط BUY وشروط SELL كما شرحها صاحب الفيديو.
+3) المؤشرات والقيم/المستويات المستخدمة.
+4) شروط الدخول والخروج، وقف الخسارة، جني الأرباح، وإدارة الصفقة.
+5) إدارة المخاطر وحجم المركز والمدة إن ذكرت.
+6) أي قواعد تظهر على الشاشة حتى لو لم تُنطق.
+7) التوقيت التقريبي (timestamp) للمقاطع التي تثبت كل قاعدة.
+8) فرّق بوضوح بين ما شاهدته/سمعته فعلاً وبين ما لا يمكن قراءته. لا تخترع أرقامًا أو قواعد.
+
+أعد تقريرًا منظمًا بالعربية، ثم في النهاية JSON صالح بالمفاتيح:
+strategy_name, description, indicators, buy_rules, sell_rules, sl_atr, tp_atr, max_hold_bars,
+evidence_timestamps, confidence.
+إذا لم توجد استراتيجية تداول واضحة، قل ذلك صراحة بدل اختراع استراتيجية.
+"""
+        for _ in range(max(1, len(GEMINI_KEYS))):
+            key = await key_manager.next_key()
+            if not key:
+                return ""
+            try:
+                return await asyncio.to_thread(
+                    _gemini_video_analyze_sync, video_path, prompt, key, GEMINI_MODELS
+                )
+            except Exception as exc:
+                low = str(exc).lower()
+                if any(x in low for x in ("429", "quota", "rate limit", "resource exhausted", "too many requests")):
+                    key_manager.cooldown(key, 60)
+                    continue
+                logger.warning("Gemini video analysis failed: %s", str(exc)[:700])
+                key_manager.cooldown(key, 30)
+        return ""
 
 
 def extract_json_from_ai(text: str) -> Optional[dict]:
@@ -1874,113 +2104,63 @@ def simulate_strategy_test(strategy: StrategyDefinition, candles: List[dict], st
     return 0.0
 
 
-def _series_metrics(values: List[float]) -> Tuple[int,float,float,float,float]:
+def _metrics_for_values(values: List[float]) -> dict:
     trades=[r for r in values if r!=0.0]; wins=[r for r in trades if r>0]; losses=[r for r in trades if r<0]
     gp=sum(wins); gl=abs(sum(losses)); pf=gp/gl if gl>0 else (99.0 if gp>0 else 0.0)
-    wr=(len(wins)/len(trades)*100.0) if trades else 0.0
-    net=sum(trades);
-    if len(trades)>1:
-        mean=sum(trades)/len(trades); var=sum((x-mean)**2 for x in trades)/(len(trades)-1); sharpe=mean/math.sqrt(var)*math.sqrt(len(trades)) if var>0 else (99.0 if mean>0 else 0.0)
-    else: sharpe=0.0
-    return len(trades),wr,pf,net,sharpe
+    wr=len(wins)/len(trades)*100 if trades else 0.0; net=sum(trades); exp=net/len(trades) if trades else 0.0
+    eq=peak=dd=0.0
+    for r in values:
+        eq+=r; peak=max(peak,eq); dd=max(dd,peak-eq)
+    return {"trades":len(trades),"wins":len(wins),"losses":len(losses),"win_rate":wr,"pf":pf,"net_r":net,"expectancy":exp,"dd":dd}
 
-def calculate_strategy_metrics(strategy_id: str, r_values: List[float], tests: int, assets_tested: int) -> StrategyResult:
-    trades = [r for r in r_values if r != 0.0]
-    wins = [r for r in trades if r > 0]
-    losses = [r for r in trades if r < 0]
-    neutral = tests - len(trades)
-    gross_profit = sum(wins)
-    gross_loss = abs(sum(losses))
-    pf = gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
-    win_rate = (len(wins) / len(trades) * 100.0) if trades else 0.0
-    net_r = sum(trades)
-    expectancy = net_r / len(trades) if trades else 0.0
 
-    equity = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    for r in r_values:
-        equity += r
-        peak = max(peak, equity)
-        max_dd = max(max_dd, peak - equity)
-
-    sample_factor = min(1.0, len(trades) / 50.0)
-    pf_factor = min(1.0, max(pf, 0.0) / 2.0)
-    wr_factor = min(1.0, win_rate / 70.0)
-    dd_factor = max(0.0, 1.0 - max_dd / max(5.0, abs(net_r) + 5.0))
-    expectancy_factor = min(1.0, max(0.0, expectancy) / 0.6)
-    score = 100.0 * (
-        0.25 * pf_factor +
-        0.20 * wr_factor +
-        0.20 * max(0.0, min(1.0, (net_r + 10.0) / 40.0)) +
-        0.15 * dd_factor +
-        0.10 * expectancy_factor +
-        0.10 * sample_factor
-    )
-    robustness = 100.0 * (
-        0.6 * sample_factor +
-        0.4 * max(0.0, min(1.0, assets_tested / max(1, len(ASSETS))))
-    )
-
-    if len(trades) < STRATEGY_MIN_TRADES:
-        verdict = "INSUFFICIENT DATA"
-    elif score >= 80 and pf >= 1.5 and net_r > 0:
-        verdict = "STRONG"
-    elif score >= 65 and pf >= 1.15 and net_r > 0:
-        verdict = "PROMISING"
-    elif score >= 50:
-        verdict = "WEAK"
-    else:
-        verdict = "FAILED"
-
-    _, _, _, _, sharpe_like = _series_metrics(r_values)
-    return StrategyResult(
-        strategy_id=strategy_id,
-        tests=tests,
-        trades=len(trades),
-        wins=len(wins),
-        losses=len(losses),
-        neutral=neutral,
-        win_rate=round(win_rate, 2),
-        profit_factor=round(pf, 3),
-        net_r=round(net_r, 3),
-        max_drawdown_r=round(max_dd, 3),
-        expectancy_r=round(expectancy, 4),
-        score=round(score, 2),
-        robustness=round(robustness, 2),
-        verdict=verdict,
-        trained_at=now_local().isoformat(),
-        assets_tested=assets_tested,
-        r_values=[round(x, 6) for x in r_values],
-        sharpe_like=round(sharpe_like, 4),
-    )
+def calculate_strategy_metrics(strategy_id: str, r_values: List[float], tests: int, assets_tested: int, oos_values: Optional[List[float]]=None) -> StrategyResult:
+    m=_metrics_for_values(r_values); o=_metrics_for_values(oos_values or [])
+    sample=min(1.0,m["trades"]/max(70.0,STRATEGY_MIN_TRADES)); pf_factor=min(1.0,max(m["pf"],0.0)/2.0); wr_factor=min(1.0,m["win_rate"]/70.0)
+    dd_factor=max(0.0,1.0-m["dd"]/max(5.0,abs(m["net_r"])+5.0)); exp_factor=min(1.0,max(0.0,m["expectancy"])/0.6)
+    oos_quality=max(0.0,min(1.0,(o["net_r"]+5.0)/20.0)) if o["trades"] else 0.0
+    score=100*(.22*pf_factor+.18*wr_factor+.18*max(0,min(1,(m["net_r"]+10)/40))+.12*dd_factor+.10*exp_factor+.10*sample+.10*oos_quality)
+    robustness=100*(.55*sample+.25*min(1,assets_tested/max(1,len(ASSETS)))+.20*(1.0 if o["trades"]>=OOS_MIN_TRADES else 0.0))
+    if m["trades"] < STRATEGY_MIN_TRADES: verdict="INSUFFICIENT DATA"
+    elif o["trades"] < OOS_MIN_TRADES or o["net_r"] <= 0: verdict="OOS FAILED"
+    elif score>=80 and m["pf"]>=1.5 and m["net_r"]>0: verdict="STRONG"
+    elif score>=65 and m["pf"]>=1.15 and m["net_r"]>0: verdict="PROMISING"
+    elif score>=50: verdict="WEAK"
+    else: verdict="FAILED"
+    return StrategyResult(strategy_id=strategy_id,tests=tests,trades=m["trades"],wins=m["wins"],losses=m["losses"],neutral=max(0,tests-m["trades"]),win_rate=round(m["win_rate"],2),profit_factor=round(m["pf"],3),net_r=round(m["net_r"],3),max_drawdown_r=round(m["dd"],3),expectancy_r=round(m["expectancy"],4),score=round(score,2),robustness=round(robustness,2),verdict=verdict,trained_at=now_local().isoformat(),assets_tested=assets_tested,r_values=[round(x,6) for x in r_values],training_trades=m["trades"],oos_tests=len(oos_values or []),oos_trades=o["trades"],oos_win_rate=round(o["win_rate"],2),oos_net_r=round(o["net_r"],3),oos_expectancy_r=round(o["expectancy"],4),oos_score=round(max(0,min(100,50+o["expectancy"]*40+o["win_rate"]*.2)),2))
 
 
 async def train_strategy(strategy: StrategyDefinition) -> StrategyResult:
-    """Train on the first 70% of sampled history and validate on the last 30%."""
     async with STRATEGY_TRAINING_LOCK:
         training_status.update({"running":True,"strategy_id":strategy.id,"strategy_name":strategy.name,"tests":0,"trades":0,"message":"loading historical candles"})
-        all_r=[]; oos_r=[]; assets_tested=0
+        train_values=[]; oos_values=[]; assets_tested=0
         try:
             for asset_key,cfg in ASSETS.items():
                 try:
-                    candles=await get_time_series(cfg["symbol"],500); max_index=len(candles)-strategy.max_hold_bars-1; first_index=60
-                    if max_index<=first_index: continue
-                    available=max_index-first_index+1; count=min(TRAINING_TESTS,available)
-                    if count==1: indices=[first_index]
-                    else: indices=sorted(set(first_index+round(i*(available-1)/(count-1)) for i in range(count)))
-                    split=max(1,int(len(indices)*0.70)); train_indices=indices[:split]; test_indices=indices[split:]
-                    for idx in train_indices: all_r.append(simulate_strategy_test(strategy,candles,idx))
-                    for idx in test_indices:
-                        r=simulate_strategy_test(strategy,candles,idx); all_r.append(r); oos_r.append(r)
-                    assets_tested+=1; training_status["tests"]=len(all_r); training_status["trades"]=sum(1 for x in all_r if x!=0.0); training_status["message"]=f"testing {asset_key}"
+                    candles=await get_time_series(cfg["symbol"], max(800, TD_OUTPUTSIZE))
+                    first=60; last=len(candles)-strategy.max_hold_bars-2
+                    if last<=first+5: continue
+                    # 80/20 chronological split; only training partition contributes to training result.
+                    split=first+int((last-first+1)*0.80)
+                    train_indices=list(range(first,split)); oos_indices=list(range(split,last+1))
+                    # Sample up to 120 training candidates per asset, but continue across assets until >=70 actual trades.
+                    step=max(1,len(train_indices)//120)
+                    for idx in train_indices[::step]:
+                        r=simulate_strategy_test(strategy,candles,idx); train_values.append(r)
+                        training_status["tests"]+=1; training_status["trades"]=sum(x!=0 for x in train_values); training_status["message"]=f"training {asset_key}"
+                    # OOS capped at 120 candidates/asset.
+                    step2=max(1,len(oos_indices)//120)
+                    for idx in oos_indices[::step2]: oos_values.append(simulate_strategy_test(strategy,candles,idx))
+                    assets_tested+=1
                 except Exception as exc: logger.warning("Strategy training failed on %s: %s",asset_key,exc)
-            result=calculate_strategy_metrics(strategy.id,all_r,len(all_r),assets_tested)
-            oos_trades,oos_wr,oos_pf,oos_net,_=_series_metrics(oos_r)
-            result.oos_trades=oos_trades; result.oos_win_rate=round(oos_wr,2); result.oos_profit_factor=round(oos_pf,3); result.oos_net_r=round(oos_net,3)
-            strategies_db["results"][strategy.id]=asdict(result); strategies_db["strategies"][strategy.id]=asdict(strategy); save_strategies(); return result
+            # If <70 actual trades, mark insufficient rather than pretending tests are trades.
+            result=calculate_strategy_metrics(strategy.id,train_values, len(train_values), assets_tested, oos_values)
+            if result.trades < STRATEGY_MIN_TRADES: result.verdict="INSUFFICIENT DATA"
+            strategies_db["results"][strategy.id]=asdict(result); strategies_db["strategies"][strategy.id]=asdict(strategy); save_strategies()
+            return result
         finally:
             training_status["running"]=False; training_status["message"]="complete"
+
 
 def strategy_from_db(strategy_id: str) -> Optional[StrategyDefinition]:
     raw = strategies_db.get("strategies", {}).get(strategy_id)
@@ -1997,9 +2177,13 @@ def result_from_db(strategy_id: str) -> Optional[StrategyResult]:
     raw = strategies_db.get("results", {}).get(strategy_id)
     if not raw:
         return None
+    raw = dict(raw)
+    defaults = {"assets_tested":0,"r_values":[],"training_trades":raw.get("trades",0),"oos_tests":0,"oos_trades":0,"oos_win_rate":0.0,"oos_net_r":0.0,"oos_expectancy_r":0.0,"oos_score":0.0}
+    for k,v in defaults.items(): raw.setdefault(k,v)
     try:
         return StrategyResult(**raw)
     except Exception:
+        logger.exception("Invalid strategy result %s", strategy_id)
         return None
 
 
@@ -2027,31 +2211,38 @@ def strategy_display(strategy: StrategyDefinition, result: Optional[StrategyResu
             f"Net R: {result.net_r}",
             f"Max drawdown R: {result.max_drawdown_r}",
             f"Expectancy R: {result.expectancy_r}",
-            f"OOS: {result.oos_trades} trades | WR {result.oos_win_rate}% | PF {result.oos_profit_factor} | Net R {result.oos_net_r}",
-            f"Sharpe-like: {result.sharpe_like}",
             f"Score: {result.score}/100",
             f"Robustness: {result.robustness}/100",
             f"Verdict: {result.verdict}",
             f"Assets tested: {result.assets_tested}",
+            f"OOS: {result.oos_trades}/{result.oos_tests} trades | WR {result.oos_win_rate}% | Net R {result.oos_net_r} | Score {result.oos_score}",
             f"Trained: {result.trained_at}",
         ]
     return "\n".join(lines)
 
 
 async def process_strategy_video(message: types.Message, url: str, original_text: str):
-    await safe_send(message, "🎥 تم اكتشاف رابط فيديو. أحاول استخراج الترجمة/النص المتاح ثم تحويله إلى استراتيجية قابلة للاختبار...")
+    await safe_send(message, "🎥 تم اكتشاف رابط فيديو. أبدأ أولًا باستخراج الترجمة إن وجدت، وإذا لم توجد سأحلل الفيديو نفسه بصريًا وصوتيًا عبر Gemini...")
 
     transcript = await extract_video_text(url)
+    source = transcript
+    source_kind = "الترجمة/النص"
+
     if not transcript:
+        await safe_send(message, "👁️ لا توجد ترجمة متاحة. جاري تنزيل الفيديو وتحليل الصور، الرسوم، الشموع، المؤشرات والصوت مباشرةً...")
+        source = await analyze_video_visually(url)
+        source_kind = "تحليل فيديو بصري/صوتي"
+
+    if not source:
         await safe_send(
             message,
-            "❌ لم أستطع استخراج نص/ترجمة من الفيديو.\n"
-            "لم أشاهد الفيديو ولم أختلق محتواه.\n"
-            "أرسل رابط فيديو يحتوي على ترجمة متاحة، أو أرسل نص الاستراتيجية مباشرة."
+            "❌ تعذر الوصول إلى محتوى الفيديو أو تحليله.\n"
+            "تأكد أن الرابط عام ويمكن تنزيله بواسطة yt-dlp، وأن Gemini API مضبوط في Render.\n"
+            "لن أختلق محتوى الفيديو أو قواعد غير موجودة."
         )
         return
 
-    strategy = await convert_content_to_strategy(url, transcript)
+    strategy = await convert_content_to_strategy(url, source)
     if not strategy:
         await safe_send(
             message,
@@ -2066,6 +2257,7 @@ async def process_strategy_video(message: types.Message, url: str, original_text
     await safe_send(
         message,
         f"🧠 تم استخراج الاستراتيجية: {strategy.name}\n"
+        f"المصدر: {source_kind}\n"
         f"ID: {strategy.id}\n\n"
         f"🧪 سأختبرها على الأقل {TRAINING_TESTS} حالة تاريخية لكل أصل متاح "
         f"وفي منطقة التدريب فقط. لن تدخل هذه الاستراتيجية في التداول الحي تلقائيًا."
@@ -2087,7 +2279,8 @@ def top_strategies(limit: int = 10):
     rows = []
     for sid, raw in strategies_db.get("results", {}).items():
         try:
-            result = StrategyResult(**raw)
+            result = result_from_db(sid)
+            if result is None: continue
             strategy = strategy_from_db(sid)
             if strategy:
                 rows.append((strategy, result))
@@ -2096,6 +2289,53 @@ def top_strategies(limit: int = 10):
     rows.sort(key=lambda pair: (pair[1].score, pair[1].profit_factor, pair[1].net_r), reverse=True)
     return rows[:limit]
 
+
+# ============================================================
+# NEWS LEARNING
+# ============================================================
+news_learning: Dict[str,dict] = {"items": []}
+
+def load_news_learning():
+    global news_learning
+    try:
+        if os.path.exists(NEWS_DB_FILE):
+            with open(NEWS_DB_FILE,"r",encoding="utf-8") as f: news_learning=json.load(f)
+            if not isinstance(news_learning,dict): news_learning={"items":[]}
+    except Exception: logger.exception("Could not load news learning")
+
+def save_news_learning():
+    try:
+        tmp=NEWS_DB_FILE+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f: json.dump(news_learning,f,ensure_ascii=False,indent=2)
+        os.replace(tmp,NEWS_DB_FILE)
+    except Exception: logger.exception("Could not save news learning")
+
+def parse_news_prediction(ai_text:str, source_text:str) -> dict:
+    obj=extract_json_from_ai(ai_text) or {}
+    if not isinstance(obj,dict): obj={}
+    assets=obj.get("assets") if isinstance(obj.get("assets"),list) else detect_assets_in_text(source_text)
+    direction=str(obj.get("direction",obj.get("impact","unknown"))).upper()
+    if direction in ("BULLISH", "BULL"): direction="BUY"
+    elif direction in ("BEARISH", "BEAR"): direction="SELL"
+    if direction not in ("BUY","SELL","MIXED","UNKNOWN"): direction="UNKNOWN"
+    try: strength=float(obj.get("strength",obj.get("confidence",0)))
+    except Exception: strength=0.0
+    try: horizon=int(obj.get("horizon_minutes",60))
+    except Exception: horizon=60
+    return {"assets":assets,"direction":direction,"strength":max(0,min(100,strength)),"horizon_minutes":max(1,horizon)}
+
+async def evaluate_news_learning():
+    changed=False; now=now_local()
+    for item in news_learning.get("items",[]):
+        if item.get("evaluated") or not item.get("start_price") or now < dt_from_string(item.get("evaluate_at",now.isoformat())): continue
+        for asset in item.get("assets",[]):
+            try:
+                price=await get_price(ASSETS[asset]["symbol"],use_cache=False)
+                start=float(item["start_price"].get(asset,price)); actual="BUY" if price>start else "SELL" if price<start else "NEUTRAL"
+                item.setdefault("results",{})[asset]={"end_price":price,"actual":actual,"correct": actual==item.get("direction")}
+            except Exception: pass
+        item["evaluated"]=True; changed=True
+    if changed: save_news_learning()
 
 # ============================================================
 # NEWS / FORWARDED TEXT
@@ -2111,55 +2351,60 @@ def detect_assets_in_text(text: str) -> List[str]:
     return found
 
 async def process_news_or_strategy(message: types.Message, text: str):
-    forward_origin=getattr(message,"forward_origin",None); is_forward=forward_origin is not None
-    url=extract_url(text)
+    forward_origin = getattr(message, "forward_origin", None)
+    is_forward = forward_origin is not None
+    url = extract_url(text)
     if url and is_video_url(url):
-        await process_strategy_video(message,url,text); return
-    is_strategy_text="استراتيجية" in text.lower() or "strategy" in text.lower()
-    kind="خبر مُعاد توجيهه" if is_forward else ("استراتيجية/نص" if is_strategy_text else "خبر")
-    await safe_send(message,f"🧠 جاري تحليل {kind}...")
-    prompt=f"""
+        await process_strategy_video(message, url, text)
+        return
+
+    is_strategy_text = "استراتيجية" in text.lower() or "strategy" in text.lower()
+    kind = "خبر مُعاد توجيهه" if is_forward else ("استراتيجية/نص" if is_strategy_text else "خبر")
+    await safe_send(message, f"🧠 جاري تحليل {kind}...")
+
+    prompt = f"""
 حلل النص التالي كمحلل مخاطر للأسواق. لا تخترع تفاصيل.
-أخرج JSON فقط بالشكل:
-{{"assets":[],"direction":"bullish|bearish|mixed|unknown","strength":1,"horizon_minutes":60,"summary":"..."}}
-assets يجب أن تكون فقط من: {list(ASSETS.keys())}.
-إذا لم يذكر النص أصلًا بوضوح، اجعل assets فارغة. horizon_minutes بين 1 و4320.
 النص:
-{text[:12000]}
+{text}
+حدد: نوع المحتوى، الأصول المتأثرة، اتجاه التأثير bullish/bearish/mixed/unknown،
+قوة 1-5، المدة دقائق/ساعات/أيام، وما يجب مراقبته.
+لا تضمن الربح.
+إذا كان النص يحتوي رابط فيديو ولم يتوفر محتواه الفعلي، لا تدّع أنك شاهدت الفيديو.
 """
-    ai=await safe_ai_generate(prompt)
-    parsed=_parse_news_json(ai)
-    if parsed:
-        display=(f"النوع: {kind}\nالأصول: {', '.join(parsed['assets']) or 'غير محددة'}\n"
-                 f"التأثير: {parsed['direction']}\nالقوة: {parsed['strength']}/5\n"
-                 f"الأفق: {format_duration_minutes(parsed['horizon_minutes'])}\n{parsed['summary']}")
-    else:
-        display=ai or "تعذر الوصول إلى Gemini حاليًا. تم استلام النص ويمكن إعادة المحاولة."
-
-    os.makedirs("memory",exist_ok=True)
-    filename="memory/strategies_memory.txt" if is_strategy_text else "memory/news_memory.txt"
+    prompt += "\nأعد أيضًا JSON صالحًا فقط في كتلة منفصلة بالمفاتيح: assets(list), direction(BUY/SELL/BULLISH/BEARISH/MIXED/UNKNOWN), strength(0-100), horizon_minutes(integer)."
+    ai = await safe_ai_generate(prompt) or "تعذر الوصول إلى Gemini حاليًا. تم استلام النص ويمكن إعادة المحاولة."
+    prediction=parse_news_prediction(ai,text)
+    item={"id":uuid.uuid4().hex[:10].upper(),"created_at":now_local().isoformat(),"source_text":text,"assets":prediction["assets"],"direction":prediction["direction"],"strength":prediction["strength"],"horizon_minutes":prediction["horizon_minutes"],"start_price":{},"evaluate_at":(now_local()+timedelta(minutes=prediction["horizon_minutes"])).isoformat(),"evaluated":False,"results":{}}
+    for a in prediction["assets"]:
+        try: item["start_price"][a]=await get_price(ASSETS[a]["symbol"],use_cache=False)
+        except Exception: pass
+    news_learning.setdefault("items",[]).append(item); news_learning["items"]=news_learning["items"][-500:]; save_news_learning()
+    os.makedirs("memory", exist_ok=True)
+    filename = "memory/strategies_memory.txt" if is_strategy_text else "memory/news_memory.txt"
     try:
-        with open(filename,"a",encoding="utf-8") as f: f.write(f"\n[{now_local().isoformat()}]\nTYPE: {kind}\nTEXT:\n{text}\nANALYSIS:\n{display}\n"+"="*70+"\n")
-    except Exception: logger.exception("Could not save memory")
+        with open(filename, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n[{now_local().isoformat()}]\nTYPE: {kind}\nTEXT:\n{text}\n"
+                f"ANALYSIS:\n{ai}\n" + "=" * 70 + "\n"
+            )
+    except Exception:
+        logger.exception("Could not save memory")
 
-    if parsed and not is_strategy_text and parsed["assets"] and parsed["direction"] in ("bullish","bearish"):
-        prices={}
-        for asset in parsed["assets"]:
-            try: prices[asset]=await get_price(ASSETS[asset]["symbol"],False)
-            except Exception: pass
-        rid="NEWS-"+uuid.uuid4().hex[:10].upper(); now=now_local()
-        news_learning["records"][rid]={"id":rid,"created_at":now.isoformat(),"due_at":(now+timedelta(minutes=parsed["horizon_minutes"])).isoformat(),
-            "assets":parsed["assets"],"direction":parsed["direction"],"strength":parsed["strength"],"horizon_minutes":parsed["horizon_minutes"],"prices":prices,"evaluated":False,"outcomes":[]}
-        save_news_learning()
-        display += f"\n\n🧠 News Learning ID: {rid}\nسيتم قياس النتيجة بعد {format_duration_minutes(parsed['horizon_minutes'])}."
+    await safe_send(message, f"📰 تحليل {kind}\n\n{ai}")
 
-    await safe_send(message,f"📰 تحليل {kind}\n\n{display}")
-    affected=detect_assets_in_text(text)
-    for trade in [t for t in list(open_trades.values()) if t.status=="OPEN" and t.asset_key in affected]:
+    affected = detect_assets_in_text(text)
+    for trade in [t for t in list(open_trades.values()) if t.status == "OPEN" and t.asset_key in affected]:
         try:
-            trade,analysis,events=await reanalyze_trade(trade,reason="news")
-            await safe_reply(trade.chat_id,f"⚡ إعادة تحليل فورية بسبب خبر\nالأصل: {trade.asset_name}\nTrade ID: {trade.id}\nالسعر: {format_price(analysis.price)}\nالإشارة: {analysis.signal}\nالحالة: {trade.status}\nالإجراء: {trade.last_action}\nTP events: {', '.join(events) if events else 'none'}")
-        except Exception: logger.exception("News reanalysis failed")
+            trade, analysis, events = await reanalyze_trade(trade, reason="news")
+            await safe_reply(
+                trade.chat_id,
+                f"⚡ إعادة تحليل فورية بسبب خبر\nالأصل: {trade.asset_name}\nTrade ID: {trade.id}\n"
+                f"السعر: {format_price(analysis.price)}\nالإشارة: {analysis.signal}\n"
+                f"الحالة: {trade.status}\nالإجراء: {trade.last_action}\n"
+                f"TP events: {', '.join(events) if events else 'none'}"
+            )
+        except Exception:
+            logger.exception("News reanalysis failed")
 
 
 @dp.message(F.text)
@@ -2191,7 +2436,7 @@ async def monitor_one_trade(trade: Trade):
             return
         # Price-only polling every 30 seconds: protects SL/TP between scheduled reviews.
         price = await get_price(trade.symbol, use_cache=False)
-        events = evaluate_trade_price(trade, price)
+        events = evaluate_trade_price(trade, price, None)
         changed = False
         notifications=[]
         for event in events:
@@ -2217,6 +2462,7 @@ async def trade_monitor():
     await asyncio.sleep(10)
     while True:
         try:
+            await evaluate_news_learning()
             trades=[t for t in list(open_trades.values()) if t.status=="OPEN"]
             # First: lightweight live price monitoring for every open trade.
             await asyncio.gather(*(monitor_one_trade(t) for t in trades), return_exceptions=True)
@@ -2242,7 +2488,6 @@ async def trade_monitor():
                     logger.exception("Scheduled reanalysis failed for %s: %s",trade.id,exc)
                     trade.last_action="DATA ERROR - RETRY"
                     save_state()
-            await evaluate_news_learning()
             # Keep at most 100 closed/expired records.
             closed=[tid for tid,t in open_trades.items() if t.status!="OPEN"]
             if len(closed)>100:
