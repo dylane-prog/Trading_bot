@@ -58,6 +58,13 @@ TD_OUTPUTSIZE = int(os.getenv("TD_OUTPUTSIZE", "300"))
 REANALYSIS_PERCENT = 0.10
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "6"))
 MIN_CONFIDENCE_TO_OPEN = float(os.getenv("MIN_CONFIDENCE_TO_OPEN", "62"))
+# Risk management for virtual/paper trading. Position size is expressed in
+# base units and assumes USD-quoted instruments. It is not broker lot sizing.
+ACCOUNT_BALANCE = max(0.0, float(os.getenv("TRADING_ACCOUNT_BALANCE", "1000")))
+RISK_PER_TRADE_PCT = max(0.0, float(os.getenv("RISK_PER_TRADE_PCT", "1.0")))
+MAX_TOTAL_OPEN_RISK_PCT = max(0.0, float(os.getenv("MAX_TOTAL_OPEN_RISK_PCT", "4.0")))
+DAILY_RISK_LIMIT_PCT = max(0.0, float(os.getenv("DAILY_RISK_LIMIT_PCT", "5.0")))
+MIN_RR = max(0.0, float(os.getenv("MIN_RR", "0.0")))
 MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "30"))
 PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "8"))
 MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "30"))
@@ -536,6 +543,14 @@ class Trade:
     management: str = "OPEN"
     score: int = 0
     confidence: float = 0.0
+    risk_percent: float = 0.0
+    risk_amount: float = 0.0
+    position_size: float = 0.0
+    rr_tp1: float = 0.0
+    rr_tp10: float = 0.0
+    realized_pnl: float = 0.0
+    close_price: float = 0.0
+    closed_at: str = ""
 
 open_trades: Dict[str, Trade] = {}
 trade_lock = asyncio.Lock()
@@ -572,6 +587,24 @@ def load_state():
             raw.setdefault("score", 0)
             raw.setdefault("confidence", 0.0)
             raw.setdefault("market_close_at", "")
+            raw.setdefault("risk_percent", 0.0)
+            raw.setdefault("risk_amount", 0.0)
+            raw.setdefault("position_size", 0.0)
+            raw.setdefault("rr_tp1", 0.0)
+            raw.setdefault("rr_tp10", 0.0)
+            raw.setdefault("realized_pnl", 0.0)
+            raw.setdefault("close_price", 0.0)
+            raw.setdefault("closed_at", "")
+            # Backward compatibility: give older open trades risk metadata
+            # without changing their entry/SL.
+            if raw.get("status") == "OPEN" and float(raw.get("risk_amount", 0.0) or 0.0) <= 0:
+                stop_distance = abs(float(raw.get("entry_price", 0.0)) - float(raw.get("sl", 0.0)))
+                if ACCOUNT_BALANCE > 0 and stop_distance > 0:
+                    raw["risk_percent"] = RISK_PER_TRADE_PCT
+                    raw["risk_amount"] = ACCOUNT_BALANCE * RISK_PER_TRADE_PCT / 100.0
+                    raw["position_size"] = raw["risk_amount"] / stop_distance
+                    raw["rr_tp1"] = abs(float(raw.get("tps", [0.0])[0]) - float(raw.get("entry_price", 0.0))) / stop_distance if raw.get("tps") else 0.0
+                    raw["rr_tp10"] = abs(float(raw.get("tps", [0.0])[-1]) - float(raw.get("entry_price", 0.0))) / stop_distance if raw.get("tps") else 0.0
             open_trades[tid] = Trade(**raw)
         logger.info("Loaded %s trades from state", len(open_trades))
     except Exception:
@@ -618,7 +651,101 @@ def calculate_trade_expiry(trade_opened_at: datetime, duration_minutes: int, ass
             return protected_close, "MARKET CLOSE"
     return normal_expiry, "TIME LIMIT"
 
-def create_trade(chat_id: int, analysis: Analysis) -> Trade:
+def calculate_trade_risk(analysis: Analysis) -> Tuple[float, float, float, float]:
+    """Calculate planned dollar risk, virtual position size and R:R values."""
+    if analysis.signal not in ("BUY", "SELL") or ACCOUNT_BALANCE <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    stop_distance = abs(analysis.price - analysis.sl)
+    if stop_distance <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+    risk_amount = ACCOUNT_BALANCE * RISK_PER_TRADE_PCT / 100.0
+    position_size = risk_amount / stop_distance
+    rr_values = [abs(tp - analysis.price) / stop_distance for tp in analysis.tps]
+    return risk_amount, position_size, (rr_values[0] if rr_values else 0.0), (rr_values[-1] if rr_values else 0.0)
+
+
+def current_open_risk() -> float:
+    return sum(max(0.0, float(t.risk_amount)) for t in open_trades.values() if t.status == "OPEN")
+
+
+def today_realized_loss() -> float:
+    today = now_local().date()
+    total = 0.0
+    for trade in open_trades.values():
+        if not trade.closed_at:
+            continue
+        try:
+            if dt_from_string(trade.closed_at).date() == today and trade.realized_pnl < 0:
+                total += abs(float(trade.realized_pnl))
+        except Exception:
+            continue
+    return total
+
+
+def today_open_risk() -> float:
+    today = now_local().date()
+    total = 0.0
+    for trade in open_trades.values():
+        if trade.status != "OPEN":
+            continue
+        try:
+            if dt_from_string(trade.opened_at).date() == today:
+                total += max(0.0, float(trade.risk_amount))
+        except Exception:
+            continue
+    return total
+
+
+def daily_risk_exposure() -> float:
+    return today_realized_loss() + today_open_risk()
+
+
+def risk_gate(analysis: Analysis) -> Tuple[bool, str, dict]:
+    risk_amount, position_size, rr_tp1, rr_tp10 = calculate_trade_risk(analysis)
+    if ACCOUNT_BALANCE <= 0:
+        return False, "TRADING_ACCOUNT_BALANCE يجب أن يكون أكبر من صفر.", {}
+    if RISK_PER_TRADE_PCT <= 0:
+        return False, "RISK_PER_TRADE_PCT يجب أن يكون أكبر من صفر.", {}
+    if MIN_RR > 0 and rr_tp1 < MIN_RR:
+        return False, f"R:R إلى TP1 = {rr_tp1:.2f} أقل من الحد {MIN_RR:.2f}.", {"risk_amount": risk_amount, "position_size": position_size, "rr_tp1": rr_tp1, "rr_tp10": rr_tp10}
+    open_after = current_open_risk() + risk_amount
+    max_open = ACCOUNT_BALANCE * MAX_TOTAL_OPEN_RISK_PCT / 100.0
+    if MAX_TOTAL_OPEN_RISK_PCT > 0 and open_after > max_open + 1e-9:
+        return False, f"مخاطر الصفقات المفتوحة بعد الإضافة {open_after:.2f}$ تتجاوز الحد {MAX_TOTAL_OPEN_RISK_PCT:.2f}% ({max_open:.2f}$).", {"risk_amount": risk_amount, "position_size": position_size, "rr_tp1": rr_tp1, "rr_tp10": rr_tp10}
+    daily_after = daily_risk_exposure() + risk_amount
+    max_daily = ACCOUNT_BALANCE * DAILY_RISK_LIMIT_PCT / 100.0
+    if DAILY_RISK_LIMIT_PCT > 0 and daily_after > max_daily + 1e-9:
+        return False, f"التعرض اليومي بعد الإضافة {daily_after:.2f}$ يتجاوز حد اليوم {DAILY_RISK_LIMIT_PCT:.2f}% ({max_daily:.2f}$).", {"risk_amount": risk_amount, "position_size": position_size, "rr_tp1": rr_tp1, "rr_tp10": rr_tp10}
+    return True, "OK", {"risk_amount": risk_amount, "position_size": position_size, "rr_tp1": rr_tp1, "rr_tp10": rr_tp10}
+
+
+def refresh_trade_risk(trade: Trade, analysis: Analysis):
+    """Keep dollar risk fixed while recalculating size after an SL adjustment."""
+    stop_distance = abs(analysis.price - analysis.sl)
+    if stop_distance <= 0:
+        return
+    if trade.risk_amount <= 0:
+        trade.risk_amount = ACCOUNT_BALANCE * RISK_PER_TRADE_PCT / 100.0
+    trade.risk_percent = RISK_PER_TRADE_PCT
+    trade.position_size = trade.risk_amount / stop_distance
+    trade.rr_tp1 = abs(analysis.tps[0] - analysis.price) / stop_distance if analysis.tps else 0.0
+    trade.rr_tp10 = abs(analysis.tps[-1] - analysis.price) / stop_distance if analysis.tps else 0.0
+
+
+def mark_trade_closed(trade: Trade, price: float, action: str, status: str = "CLOSED"):
+    trade.status = status
+    trade.management = "CLOSE"
+    trade.last_action = action
+    trade.close_price = float(price)
+    trade.closed_at = now_local().isoformat()
+    if trade.position_size > 0:
+        if trade.side == "BUY":
+            trade.realized_pnl = (price - trade.entry_price) * trade.position_size
+        elif trade.side == "SELL":
+            trade.realized_pnl = (trade.entry_price - price) * trade.position_size
+
+
+def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None) -> Trade:
     now = now_local()
     mins = max(1, round(analysis.duration_minutes * REANALYSIS_PERCENT))
     expiry, _reason = calculate_trade_expiry(now, analysis.duration_minutes, analysis.asset_key)
@@ -632,6 +759,11 @@ def create_trade(chat_id: int, analysis: Analysis) -> Trade:
         next_reanalysis_at=(now + timedelta(minutes=mins)).isoformat(),
         market_close_at=market_close.isoformat() if market_close else "",
         last_price=analysis.price, score=analysis.score, confidence=analysis.confidence,
+        risk_percent=RISK_PER_TRADE_PCT,
+        risk_amount=float((risk or {}).get("risk_amount", 0.0)),
+        position_size=float((risk or {}).get("position_size", 0.0)),
+        rr_tp1=float((risk or {}).get("rr_tp1", 0.0)),
+        rr_tp10=float((risk or {}).get("rr_tp10", 0.0)),
     )
 
 def trade_status_text(trade: Trade) -> str:
@@ -643,6 +775,9 @@ def trade_status_text(trade: Trade) -> str:
         f"Entry: {format_price(trade.entry_price)}\n"
         f"SL: {format_price(trade.sl)}\n"
         f"Last price: {format_price(trade.last_price)}\n"
+        f"Risk: {trade.risk_amount:.2f}$ ({trade.risk_percent:.2f}%)\n"
+        f"Position size: {trade.position_size:.6f} units\n"
+        f"R:R TP1 / TP10: {trade.rr_tp1:.2f} / {trade.rr_tp10:.2f}\n"
         f"Management: {trade.management}\n"
         f"Reached TP: {reached}\n"
         f"Next reanalysis: {next_time}\n"
@@ -667,20 +802,20 @@ def evaluate_trade_price(trade: Trade, price: float) -> List[str]:
     trade.last_price = price
     if trade.side == "BUY":
         if price <= trade.sl:
-            trade.status = "CLOSED"; trade.management = "CLOSE"; trade.last_action = "CLOSE - SL"; return ["SL"]
+            mark_trade_closed(trade, price, "CLOSE - SL"); return ["SL"]
         for i, tp in enumerate(trade.tps, 1):
             if i not in trade.hit_tps and price >= tp:
                 trade.hit_tps.append(i); events.append(f"TP{i}")
     elif trade.side == "SELL":
         if price >= trade.sl:
-            trade.status = "CLOSED"; trade.management = "CLOSE"; trade.last_action = "CLOSE - SL"; return ["SL"]
+            mark_trade_closed(trade, price, "CLOSE - SL"); return ["SL"]
         for i, tp in enumerate(trade.tps, 1):
             if i not in trade.hit_tps and price <= tp:
                 trade.hit_tps.append(i); events.append(f"TP{i}")
     if events:
         trade.last_action = events[-1] + " HIT"
         if len(trade.hit_tps) >= len(trade.tps):
-            trade.status = "CLOSED"; trade.management = "CLOSE"; trade.last_action = "CLOSE - FINAL TP"
+            mark_trade_closed(trade, price, "CLOSE - FINAL TP")
             events.append("FINAL TP")
     return events
 
@@ -690,10 +825,7 @@ def evaluate_trade_price(trade: Trade, price: float) -> List[str]:
 async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trade, Analysis, List[str]]:
     now = now_local()
     if trade_expired(trade, now):
-        trade.status = "EXPIRED"
-        trade.management = "CLOSE"
-        if not trade.last_action.startswith("EXPIRED -"):
-            trade.last_action = "EXPIRED - TIME LIMIT"
+        mark_trade_closed(trade, trade.last_price, trade.last_action or "EXPIRED - TIME LIMIT", status="EXPIRED")
         trade.last_review_at = now.isoformat()
         save_state()
         # Analysis is only needed by callers that expect it; fetch one current snapshot.
@@ -726,6 +858,7 @@ async def reanalyze_trade(trade: Trade, reason: str = "scheduled") -> Tuple[Trad
         trade.hit_tps = []
         trade.notified_tps = []
         trade.estimated_duration_minutes = max(1, analysis.duration_minutes)
+        refresh_trade_risk(trade, analysis)
         close_at = next_market_close(trade.asset_key, now)
         trade.market_close_at = close_at.isoformat() if close_at else ""
 
@@ -764,11 +897,19 @@ async def perform_asset_analysis(message: types.Message, asset_key: str, create_
             if len([t for t in open_trades.values() if t.status == "OPEN"]) >= MAX_OPEN_TRADES:
                 await safe_send(message, "⚠️ تم الوصول إلى الحد الأقصى للصفقات المفتوحة.")
                 return
-            trade = create_trade(message.chat.id, analysis)
+            allowed, risk_reason, risk = risk_gate(analysis)
+            if not allowed:
+                await safe_send(message, analysis_message(analysis, ai_note) + f"\n\n🛡️ لم تُفتح الصفقة بسبب إدارة المخاطر: {risk_reason}")
+                return
+            trade = create_trade(message.chat.id, analysis, risk)
             open_trades[trade.id] = trade
             save_state()
         await safe_send(message, analysis_message(analysis, ai_note, trade.id) +
-                         "\n\n🟢 تم تسجيل الصفقة في مدير الصفقات.\nالمتابعة الحية كل 30 ثانية، وإعادة التحليل كل 10% من المدة.")
+                         f"\n\n🟢 تم تسجيل الصفقة في مدير الصفقات.\n"
+                         f"المخاطرة: {trade.risk_amount:.2f}$ ({trade.risk_percent:.2f}%)\n"
+                         f"حجم المركز: {trade.position_size:.6f} وحدة\n"
+                         f"R:R TP1/TP10: {trade.rr_tp1:.2f}/{trade.rr_tp10:.2f}\n"
+                         "المتابعة الحية كل 30 ثانية، وإعادة التحليل كل 10% من المدة.")
     else:
         text = analysis_message(analysis, ai_note)
         if analysis.signal in ("BUY", "SELL"):
@@ -783,7 +924,7 @@ async def cmd_start(message: types.Message):
     await safe_send(message,
         "👑 مرحبًا بك في Trading Bot\n\n"
         "📈 التحليل الحي:\n/gold\n/btc\n/eurusd\n/silver\n/oil\n/eth\n\n"
-        "📌 إدارة الصفقات:\n/trades\n/close ALL\n/close TRADE_ID\n/reanalyze TRADE_ID\n/status\n\n"
+        "📌 إدارة الصفقات:\n/trades\n/close ALL\n/close TRADE_ID\n/reanalyze TRADE_ID\n/status\n/risk\n\n"
         "🧪 الاختبار والتعلم:\n/auto_backtest\n/weekly_table\n/strategies\n/strategy STRATEGY_ID\n/training\n/retrain STRATEGY_ID\n\n"
         "🎥 أرسل رابط فيديو للاستراتيجية؛ سيُستخرج النص المتاح ويُختبر تاريخيًا في منطقة التدريب فقط.\n"
         "📰 أرسل أو أعد توجيه خبر إلى البوت لتحليل تأثيره.\n\n"
@@ -801,12 +942,31 @@ async def cmd_status(message: types.Message):
         f"Gemini keys: {len(GEMINI_KEYS)}\n"
         f"Gemini models: {', '.join(GEMINI_MODELS)}\n"
         f"Open trades: {open_count} / {MAX_OPEN_TRADES}\n"
+        f"Risk: {RISK_PER_TRADE_PCT:.2f}%/trade | Open {current_open_risk():.2f}$ / {ACCOUNT_BALANCE * MAX_TOTAL_OPEN_RISK_PCT / 100.0:.2f}$\n"
+        f"Daily risk: {daily_risk_exposure():.2f}$ / {ACCOUNT_BALANCE * DAILY_RISK_LIMIT_PCT / 100.0:.2f}$\n"
         f"Monitor: {MONITOR_SECONDS}s\n"
         "Timezone: Africa/Algiers\n"
         f"Market interval: {TD_INTERVAL}\n"
         f"Market candles: {TD_OUTPUTSIZE}\n"
         f"State file: {STATE_FILE}"
     )
+
+@dp.message(Command("risk"))
+async def cmd_risk(message: types.Message):
+    open_risk = current_open_risk()
+    max_open = ACCOUNT_BALANCE * MAX_TOTAL_OPEN_RISK_PCT / 100.0
+    daily = daily_risk_exposure()
+    max_daily = ACCOUNT_BALANCE * DAILY_RISK_LIMIT_PCT / 100.0
+    await safe_send(message,
+        "🛡️ إدارة المخاطر\n\n"
+        f"الحساب الافتراضي: {ACCOUNT_BALANCE:.2f}$\n"
+        f"مخاطرة الصفقة: {RISK_PER_TRADE_PCT:.2f}% = {ACCOUNT_BALANCE * RISK_PER_TRADE_PCT / 100.0:.2f}$\n"
+        f"مخاطر الصفقات المفتوحة: {open_risk:.2f}$ / {max_open:.2f}$\n"
+        f"التعرض اليومي: {daily:.2f}$ / {max_daily:.2f}$\n"
+        f"الحد الأدنى R:R إلى TP1: {MIN_RR:.2f}\n\n"
+        "حجم المركز المعروض وحدات افتراضية للأصول المسعّرة بالدولار، وليس lot size خاصًا بوسيط."
+    )
+
 
 @dp.message(Command("gold"))
 async def c_gold(message: types.Message): await perform_asset_analysis(message, "gold")
@@ -868,11 +1028,11 @@ async def cmd_close(message: types.Message):
         if target == "ALL":
             for t in open_trades.values():
                 if t.status == "OPEN":
-                    t.status = "CLOSED"; t.management = "CLOSE"; t.last_action = "CLOSE - USER"; closed += 1
+                    mark_trade_closed(t, t.last_price, "CLOSE - USER"); closed += 1
         else:
             t = open_trades.get(target)
             if t and t.status == "OPEN":
-                t.status = "CLOSED"; t.management = "CLOSE"; t.last_action = "CLOSE - USER"; closed = 1
+                mark_trade_closed(t, t.last_price, "CLOSE - USER"); closed = 1
         save_state()
     await safe_send(message, f"تم إغلاق {closed} صفقة مسجلة.")
 
@@ -1761,6 +1921,7 @@ async def monitor_one_trade(trade: Trade):
         # Market-close protection is checked before the next price request.
         # This guarantees a trade cannot remain OPEN after the configured close.
         if trade_expired(trade):
+            mark_trade_closed(trade, trade.last_price, trade.last_action or "EXPIRED - TIME LIMIT", status="EXPIRED")
             save_state()
             await safe_reply(trade.chat_id,
                 f"⏰ إغلاق تلقائي بسبب إغلاق السوق\nالأصل: {trade.asset_name}\n"
@@ -1838,6 +1999,8 @@ async def health(request: web.Request):
         "open_trades":len([t for t in open_trades.values() if t.status=="OPEN"]),
         "market_data_configured":bool(TWELVE_DATA_API_KEY), "gemini_keys":len(GEMINI_KEYS),
         "time":now_local().isoformat(), "monitor_seconds":MONITOR_SECONDS,
+        "account_balance":ACCOUNT_BALANCE, "risk_per_trade_pct":RISK_PER_TRADE_PCT,
+        "open_risk":current_open_risk(), "daily_risk_exposure":daily_risk_exposure(),
     })
 
 async def start_web_server():
