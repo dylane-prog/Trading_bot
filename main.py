@@ -1770,6 +1770,40 @@ def _download_video_for_ai(url: str, tmp_dir: str) -> Optional[str]:
     return str(files[0])
 
 
+def _gemini_video_url_analyze_sync(url: str, prompt: str, key: str, models: List[str]) -> str:
+    """Analyze a public YouTube video directly through Gemini, without yt-dlp.
+
+    Gemini's video URL input is especially useful on Render because it avoids
+    relying on YouTube's downloader, cookies, format extraction, or subtitles.
+    """
+    if genai is None or not key:
+        return ""
+    client = genai.Client(api_key=key)
+    last_error = ""
+    for model in models:
+        try:
+            # Interactions is the current multimodal video path.
+            interaction = client.interactions.create(
+                model=model,
+                input=[
+                    {"type": "video", "uri": url},
+                    {"type": "text", "text": prompt},
+                ],
+            )
+            text = getattr(interaction, "output_text", None)
+            if text:
+                return str(text).strip()
+        except Exception as exc:
+            last_error = str(exc)
+            low = last_error.lower()
+            if any(x in low for x in ("not found", "404", "unsupported", "does not exist", "invalid model")):
+                continue
+            raise
+    if last_error:
+        raise RuntimeError(last_error)
+    return ""
+
+
 def _gemini_video_analyze_sync(video_path: str, prompt: str, key: str, models: List[str]) -> str:
     """Synchronous Gemini Files API video analysis, executed in a worker thread."""
     if genai is None or not key:
@@ -1793,13 +1827,22 @@ def _gemini_video_analyze_sync(video_path: str, prompt: str, key: str, models: L
     last_error = ""
     for model in models:
         try:
-            response = client.models.generate_content(
+            # Current Gemini video-understanding API.
+            interaction = client.interactions.create(
                 model=model,
-                contents=[uploaded, prompt],
+                input=[
+                    {
+                        "type": "video",
+                        "uri": uploaded.uri,
+                        "mime_type": getattr(uploaded, "mime_type", "video/mp4"),
+                        "processing": {"type": "static", "fps": float(os.getenv("VIDEO_ANALYSIS_FPS", "0.5"))},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
             )
-            text = getattr(response, "text", None)
+            text = getattr(interaction, "output_text", None)
             if text:
-                return text.strip()
+                return str(text).strip()
         except Exception as exc:
             last_error = str(exc)
             low = last_error.lower()
@@ -1811,20 +1854,8 @@ def _gemini_video_analyze_sync(video_path: str, prompt: str, key: str, models: L
     return ""
 
 
-async def analyze_video_visually(url: str) -> str:
-    """
-    Full multimodal fallback for videos without subtitles.
-
-    Gemini receives the actual video, so it can inspect frames, charts, on-screen
-    indicators, spoken audio and temporal order instead of relying on captions.
-    """
-    if genai is None or not GEMINI_KEYS:
-        return ""
-    with tempfile.TemporaryDirectory(prefix="strategy_video_media_") as tmp:
-        video_path = await asyncio.to_thread(_download_video_for_ai, url, tmp)
-        if not video_path:
-            return ""
-        prompt = """
+def _video_analysis_prompt() -> str:
+    return """
 أنت محلل فيديو متخصص في استخراج استراتيجيات التداول. حلّل الفيديو نفسه بصريًا وزمنيًا
 وصوتيًا، ولا تعتمد على وجود ترجمة. إذا كان هناك كلام مسموع فاستخرج مضمونه المفيد،
 وإذا ظهرت شاشات تداول/شموع/مؤشرات/رسوم فحللها بصريًا. ابحث تحديدًا عن:
@@ -1843,22 +1874,54 @@ strategy_name, description, indicators, buy_rules, sell_rules, sl_atr, tp_atr, m
 evidence_timestamps, confidence.
 إذا لم توجد استراتيجية تداول واضحة، قل ذلك صراحة بدل اختراع استراتيجية.
 """
+
+
+async def analyze_video_visually(url: str) -> str:
+    """
+    Full multimodal fallback for videos without subtitles.
+
+    For YouTube, Gemini can consume the public URL directly, which is the most
+    reliable path on Render. Other supported social platforms fall back to a
+    yt-dlp download and then Gemini Files API.
+    """
+    if genai is None or not GEMINI_KEYS:
+        return ""
+
+    prompt = _video_analysis_prompt()
+    youtube = any(host in url.lower() for host in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
+
+    async def try_keyed_call(callable_fn):
         for _ in range(max(1, len(GEMINI_KEYS))):
             key = await key_manager.next_key()
             if not key:
                 return ""
             try:
-                return await asyncio.to_thread(
-                    _gemini_video_analyze_sync, video_path, prompt, key, GEMINI_MODELS
-                )
+                return await asyncio.to_thread(callable_fn, key)
             except Exception as exc:
                 low = str(exc).lower()
                 if any(x in low for x in ("429", "quota", "rate limit", "resource exhausted", "too many requests")):
                     key_manager.cooldown(key, 60)
                     continue
-                logger.warning("Gemini video analysis failed: %s", str(exc)[:700])
+                logger.warning("Gemini video analysis failed: %s", str(exc)[:1000])
                 key_manager.cooldown(key, 30)
         return ""
+
+    # Preferred path: no video download at all. Gemini fetches the public YouTube URL.
+    if youtube:
+        result = await try_keyed_call(
+            lambda key: _gemini_video_url_analyze_sync(url, prompt, key, GEMINI_MODELS)
+        )
+        if result:
+            return result
+
+    # Fallback for YouTube failures and for Vimeo/Dailymotion/TikTok/etc.
+    with tempfile.TemporaryDirectory(prefix="strategy_video_media_") as tmp:
+        video_path = await asyncio.to_thread(_download_video_for_ai, url, tmp)
+        if not video_path:
+            return ""
+        return await try_keyed_call(
+            lambda key: _gemini_video_analyze_sync(video_path, prompt, key, GEMINI_MODELS)
+        )
 
 
 def extract_json_from_ai(text: str) -> Optional[dict]:
