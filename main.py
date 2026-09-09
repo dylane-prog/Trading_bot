@@ -80,6 +80,8 @@ PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "8"))
 MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "30"))
 MIN_TRADE_DURATION_MINUTES = max(1, int(os.getenv("MIN_TRADE_DURATION_MINUTES", "1")))
 MAX_TRADE_DURATION_MINUTES = min(72 * 60, max(MIN_TRADE_DURATION_MINUTES, int(os.getenv("MAX_TRADE_DURATION_MINUTES", str(72 * 60)))))
+VIDEO_TRADE_MAX = max(1, min(50, int(os.getenv("VIDEO_TRADE_MAX", "20"))))
+VIDEO_AGENTIC = os.getenv("VIDEO_AGENTIC", "true").lower() in ("1", "true", "yes", "on")
 # Market-close protection: trades are never allowed to outlive the next
 # configured market close. Times are UTC. Crypto is 24/7 and has no close.
 MARKET_CLOSE_PROTECTION = os.getenv("MARKET_CLOSE_PROTECTION", "true").lower() in ("1", "true", "yes", "on")
@@ -715,6 +717,31 @@ class Trade:
 open_trades: Dict[str, Trade] = {}
 trade_lock = asyncio.Lock()
 
+@dataclass
+class VideoTradeSetup:
+    id: str
+    source_url: str
+    source_timestamp: str
+    asset_key: str
+    asset_name: str
+    side: str
+    entry_price: float
+    sl: float
+    tps: List[float]
+    duration_minutes: int
+    confidence: float
+    rationale: str
+    evidence: str = ""
+    completeness: float = 0.0
+    rr_tp1: float = 0.0
+    rr_tp10: float = 0.0
+    rank_score: float = 0.0
+    status: str = "EXTRACTED"
+    created_at: str = ""
+
+video_trade_setups: Dict[str, VideoTradeSetup] = {}
+video_trade_lock = asyncio.Lock()
+
 
 def now_local() -> datetime:
     return datetime.now(LOCAL_TZ)
@@ -856,6 +883,48 @@ def migrate_legacy_json_to_persistence():
                     logger.info("Migrated legacy news learning database to PostgreSQL")
             except Exception:
                 logger.exception("Legacy news migration failed")
+
+
+def save_video_trade_setups():
+    try:
+        data = {k: asdict(v) for k, v in video_trade_setups.items()}
+        if _persistent_set("video_trade_setups", data):
+            return
+        tmp = "video_trade_setups.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, "video_trade_setups.json")
+    except Exception:
+        logger.exception("Could not save video trade setups")
+
+
+def load_video_trade_setups():
+    global video_trade_setups
+    try:
+        data = _persistent_get("video_trade_setups")
+        if data is None and os.path.exists("video_trade_setups.json"):
+            with open("video_trade_setups.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        for sid, raw in data.items():
+            if not isinstance(raw, dict):
+                continue
+            raw.setdefault("source_timestamp", "")
+            raw.setdefault("evidence", "")
+            raw.setdefault("completeness", 0.0)
+            raw.setdefault("rr_tp1", 0.0)
+            raw.setdefault("rr_tp10", 0.0)
+            raw.setdefault("rank_score", 0.0)
+            raw.setdefault("status", "EXTRACTED")
+            raw.setdefault("created_at", now_local().isoformat())
+            try:
+                video_trade_setups[sid] = VideoTradeSetup(**raw)
+            except Exception:
+                logger.warning("Skipping invalid video trade setup %s", sid)
+        logger.info("Loaded %s video trade setups from %s", len(video_trade_setups), persistence_status())
+    except Exception:
+        logger.exception("Could not load video trade setups")
 
 
 def save_state():
@@ -1258,12 +1327,41 @@ async def perform_asset_analysis(message: types.Message, asset_key: str, create_
 # ============================================================
 # BUTTON-BASED TELEGRAM UI
 # ============================================================
+def trade_priority_key(trade: Trade):
+    now = now_local()
+    try:
+        due = dt_from_string(trade.next_reanalysis_at)
+        overdue = 1 if due <= now else 0
+        minutes_to_review = (due - now).total_seconds() / 60.0
+    except Exception:
+        overdue, minutes_to_review = 0, 999999.0
+    # Highest priority: overdue reviews, then low confidence, then open risk,
+    # then realized R. This is a management priority, not a claim of profit.
+    return (overdue, -minutes_to_review, -float(trade.confidence), float(trade.risk_amount), float(trade.realized_r))
+
+
+async def reanalyze_all_open_trades(reason: str = "manual") -> List[Trade]:
+    async with trade_lock:
+        trades = sorted([t for t in open_trades.values() if t.status == "OPEN"], key=trade_priority_key, reverse=True)
+    results = []
+    for trade in trades:
+        try:
+            updated, _, _ = await reanalyze_trade(trade, reason=reason)
+            results.append(updated)
+        except Exception as exc:
+            trade.last_action = "DATA ERROR - RETRY"
+            logger.exception("Batch reanalysis failed for %s: %s", trade.id, exc)
+    save_state()
+    return sorted(results, key=trade_priority_key, reverse=True)
+
+
 def main_keyboard():
     return types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="🥇 Gold",callback_data="asset:gold"),types.InlineKeyboardButton(text="₿ BTC",callback_data="asset:btc")],
         [types.InlineKeyboardButton(text="💶 EUR/USD",callback_data="asset:eurusd"),types.InlineKeyboardButton(text="🥈 Silver",callback_data="asset:silver")],
         [types.InlineKeyboardButton(text="🛢 Oil",callback_data="asset:oil"),types.InlineKeyboardButton(text="Ξ ETH",callback_data="asset:eth")],
-        [types.InlineKeyboardButton(text="📋 Open Trades",callback_data="trades"),types.InlineKeyboardButton(text="⚙️ Status",callback_data="status")],
+        [types.InlineKeyboardButton(text="📋 Open Trades",callback_data="trades"),types.InlineKeyboardButton(text="🎯 Video Trades",callback_data="video_trades")],
+        [types.InlineKeyboardButton(text="⚙️ Status",callback_data="status")],
         [types.InlineKeyboardButton(text="🛡 Risk",callback_data="risk"),types.InlineKeyboardButton(text="🧠 Strategies",callback_data="strategies")],
         [types.InlineKeyboardButton(text="🧪 Training",callback_data="training"),types.InlineKeyboardButton(text="🏆 Ranking",callback_data="ranking")],
         [types.InlineKeyboardButton(text="📊 Backtest",callback_data="backtest"),types.InlineKeyboardButton(text="📅 Performance",callback_data="performance")],
@@ -1334,9 +1432,36 @@ async def cb_risk(call: types.CallbackQuery):
 async def cb_trades(call: types.CallbackQuery):
     await call.answer(); trades=[t for t in open_trades.values() if t.status=="OPEN"]
     if not trades: await call.message.edit_text("📋 لا توجد صفقات مفتوحة.",reply_markup=main_keyboard()); return
-    kb=[]
-    for t in trades: kb.append([types.InlineKeyboardButton(text=f"{t.asset_name} {t.side} • {t.id}",callback_data=f"trade:{t.id}")])
-    kb.append([types.InlineKeyboardButton(text="⚠️ Close ALL",callback_data="close_all_confirm")]); kb.append([types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]); await call.message.edit_text("📋 الصفقات المفتوحة",reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb))
+    trades.sort(key=trade_priority_key, reverse=True)
+    kb=[[types.InlineKeyboardButton(text="🔄 Reanalyze ALL",callback_data="reanalyze_all")]]
+    for t in trades: kb.append([types.InlineKeyboardButton(text=f"{t.asset_name} {t.side} • {t.id} • {t.confidence:.0f}%",callback_data=f"trade:{t.id}")])
+    kb.append([types.InlineKeyboardButton(text="⚠️ Close ALL",callback_data="close_all_confirm")]); kb.append([types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]); await call.message.edit_text("📋 الصفقات المفتوحة — مرتبة حسب أولوية المتابعة",reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "reanalyze_all")
+async def cb_reanalyze_all(call: types.CallbackQuery):
+    await call.answer("إعادة تحليل كل الصفقات...")
+    try:
+        results = await reanalyze_all_open_trades("batch-button")
+        if not results:
+            await call.message.edit_text("📋 لا توجد صفقات مفتوحة لإعادة تحليلها.", reply_markup=main_keyboard())
+            return
+        lines = ["🔄 تمت إعادة تحليل كل الصفقات المفتوحة", ""]
+        for i, t in enumerate(results, 1):
+            lines.append(f"{i}. {t.asset_name} {t.side} | {t.id} | {t.management} | {t.confidence:.0f}% | R {t.realized_r:.2f}")
+        await call.message.edit_text("\n".join(lines), reply_markup=main_keyboard())
+    except Exception as exc:
+        await call.message.edit_text(f"❌ فشل إعادة التحليل الجماعي: {str(exc)[:700]}", reply_markup=main_keyboard())
+
+
+@dp.callback_query(F.data == "video_trades")
+async def cb_video_trades(call: types.CallbackQuery):
+    await call.answer()
+    rows = sorted(video_trade_setups.values(), key=lambda x: (x.rank_score, x.confidence), reverse=True)[:VIDEO_TRADE_MAX]
+    if not rows:
+        await call.message.edit_text("🎯 لا توجد صفقات مستخرجة من الفيديوهات بعد.", reply_markup=main_keyboard())
+        return
+    await call.message.edit_text(video_trade_summary(rows, VIDEO_TRADE_MAX), reply_markup=main_keyboard())
+
 
 @dp.callback_query(F.data.startswith("trade:"))
 async def cb_trade(call: types.CallbackQuery):
@@ -1499,9 +1624,16 @@ async def cmd_trades(message: types.Message):
 async def cmd_reanalyze(message: types.Message):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await safe_send(message, "الاستخدام: /reanalyze TRADE_ID")
+        await safe_send(message, "الاستخدام: /reanalyze TRADE_ID أو /reanalyze ALL")
         return
     tid = parts[1].strip().upper()
+    if tid == "ALL":
+        results = await reanalyze_all_open_trades("manual-all")
+        if not results:
+            await safe_send(message, "📋 لا توجد صفقات مفتوحة لإعادة تحليلها.")
+            return
+        await safe_send(message, "🔄 إعادة تحليل كل الصفقات\n\n" + "\n".join(f"{i}. {t.asset_name} {t.side} | {t.id} | {t.management} | {t.confidence:.0f}%" for i,t in enumerate(results,1)))
+        return
     trade = open_trades.get(tid)
     if not trade or trade.status != "OPEN":
         await safe_send(message, "❌ الصفقة غير موجودة أو ليست مفتوحة.")
@@ -1938,8 +2070,8 @@ def _gemini_video_url_analyze_sync(url: str, prompt: str, key: str, models: List
             interaction = client.interactions.create(
                 model=model,
                 input=[
+                    {"type": "video", "uri": url, **({"processing": "agentic"} if VIDEO_AGENTIC else {})},
                     {"type": "text", "text": prompt},
-                    {"type": "video", "uri": url},
                 ],
             )
             text = getattr(interaction, "output_text", None)
@@ -2006,8 +2138,7 @@ def _gemini_video_analyze_sync(video_path: str, prompt: str, key: str, models: L
                         "type": "video",
                         "uri": uploaded.uri,
                         "mime_type": getattr(uploaded, "mime_type", "video/mp4"),
-                        # Omit processing metadata for maximum SDK compatibility;
-                        # Gemini's default video processing is static and timestamped.
+                        **({"processing": "agentic"} if VIDEO_AGENTIC else {}),
                     },
                     {"type": "text", "text": prompt},
                 ],
@@ -2043,8 +2174,20 @@ def _video_analysis_prompt() -> str:
 
 أعد تقريرًا منظمًا بالعربية، ثم في النهاية JSON صالح بالمفاتيح:
 strategy_name, description, indicators, buy_rules, sell_rules, sl_atr, tp_atr, max_hold_bars,
-evidence_timestamps, confidence.
-إذا لم توجد استراتيجية تداول واضحة، قل ذلك صراحة بدل اختراع استراتيجية.
+evidence_timestamps, confidence,
+trade_setups: [
+  {
+    "timestamp": "MM:SS", "asset": "gold|btc|eurusd|silver|oil|eth",
+    "side": "BUY|SELL", "entry": null, "sl": null,
+    "tp1": null, "tp2": null, "tp3": null, "tp4": null, "tp5": null,
+    "tp6": null, "tp7": null, "tp8": null, "tp9": null, "tp10": null,
+    "duration_minutes": null, "confidence": 0,
+    "rationale": "", "evidence": ""
+  }
+].
+في trade_setups أدرج فقط الصفقات التي شاهدت أو سمعت تفاصيلها فعلاً.
+إذا لم يذكر الفيديو سعر الدخول/SL/TP، اتركه null ولا تخمّن.
+إذا ظهرت صفقة متعددة الأهداف، احتفظ بكل الأهداف التي أمكن قراءتها.
 """
 
 
@@ -2457,6 +2600,130 @@ def strategy_display(strategy: StrategyDefinition, result: Optional[StrategyResu
     return "\n".join(lines)
 
 
+def _video_asset_key(value: str) -> Optional[str]:
+    text = str(value or "").lower().strip()
+    aliases = {
+        "gold": "gold", "xau": "gold", "xau/usd": "gold", "ذهب": "gold",
+        "btc": "btc", "bitcoin": "btc", "btc/usd": "btc",
+        "eurusd": "eurusd", "eur/usd": "eurusd", "euro": "eurusd",
+        "silver": "silver", "xag": "silver", "xag/usd": "silver",
+        "oil": "oil", "wti": "oil", "crude": "oil",
+        "eth": "eth", "ethereum": "eth", "eth/usd": "eth",
+    }
+    return aliases.get(text)
+
+
+def _safe_float(value, default=0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _rank_video_trade_setup(setup: VideoTradeSetup) -> float:
+    score = 0.0
+    score += min(30.0, max(0.0, setup.confidence) * 0.30)
+    score += min(30.0, max(0.0, setup.completeness) * 0.30)
+    if setup.rr_tp1 > 0:
+        score += min(15.0, setup.rr_tp1 * 6.0)
+    if setup.rr_tp10 > 0:
+        score += min(15.0, setup.rr_tp10 * 3.0)
+    if setup.source_timestamp:
+        score += 5.0
+    if setup.rationale:
+        score += 5.0
+    return round(min(100.0, score), 2)
+
+
+async def extract_video_trade_setups(source_url: str, source_text: str) -> List[VideoTradeSetup]:
+    prompt = f"""
+استخرج صفقات التداول التي قُدمت فعليًا داخل محتوى الفيديو/التحليل التالي.
+لا تنشئ صفقة جديدة من عندك ولا تحوّل مجرد رأي عام إلى صفقة.
+لكل صفقة أعطِ timestamp إن توفر، الأصل، BUY/SELL، الدخول، SL، TP1..TP10، المدة، الثقة، والسبب.
+الأرقام غير الواضحة يجب أن تكون null. لا تملأ أرقامًا بالتخمين.
+أعد JSON فقط بالشكل:
+{{
+  "trades": [{{
+    "timestamp":"MM:SS", "asset":"gold|btc|eurusd|silver|oil|eth",
+    "side":"BUY|SELL", "entry":null, "sl":null,
+    "tp1":null,"tp2":null,"tp3":null,"tp4":null,"tp5":null,
+    "tp6":null,"tp7":null,"tp8":null,"tp9":null,"tp10":null,
+    "duration_minutes":null,"confidence":0,"rationale":"","evidence":""
+  }}]
+}}
+
+المحتوى:
+{source_text[:50000]}
+"""
+    ai = await safe_ai_generate(prompt)
+    obj = extract_json_from_ai(ai) or {}
+    rows = obj.get("trades") if isinstance(obj.get("trades"), list) else []
+    result: List[VideoTradeSetup] = []
+    for raw in rows[:VIDEO_TRADE_MAX]:
+        if not isinstance(raw, dict):
+            continue
+        asset_key = _video_asset_key(raw.get("asset"))
+        side = str(raw.get("side", "")).upper().strip()
+        if asset_key not in ASSETS or side not in ("BUY", "SELL"):
+            continue
+        entry = _safe_float(raw.get("entry"), 0.0)
+        sl = _safe_float(raw.get("sl"), 0.0)
+        tps = []
+        for i in range(1, 11):
+            v = raw.get(f"tp{i}")
+            if v is not None and str(v).strip() not in ("", "null", "None"):
+                fv = _safe_float(v, 0.0)
+                if fv > 0:
+                    tps.append(fv)
+        duration = max(0, int(_safe_float(raw.get("duration_minutes"), 0)))
+        confidence = max(0.0, min(100.0, _safe_float(raw.get("confidence"), 0.0)))
+        complete_fields = 2 + min(10, len(tps))
+        possible_fields = 12
+        if entry > 0: complete_fields += 1
+        if sl > 0: complete_fields += 1
+        completeness = min(100.0, complete_fields / possible_fields * 100.0)
+        rr1 = abs(tps[0] - entry) / abs(entry - sl) if entry > 0 and sl > 0 and tps and abs(entry-sl) > 0 else 0.0
+        rr10 = abs(tps[-1] - entry) / abs(entry - sl) if entry > 0 and sl > 0 and tps and abs(entry-sl) > 0 else 0.0
+        setup = VideoTradeSetup(
+            id=uuid.uuid4().hex[:10].upper(),
+            source_url=source_url,
+            source_timestamp=str(raw.get("timestamp", "") or ""),
+            asset_key=asset_key,
+            asset_name=ASSETS[asset_key]["name"],
+            side=side, entry_price=entry, sl=sl, tps=tps,
+            duration_minutes=duration, confidence=confidence,
+            rationale=str(raw.get("rationale", "") or "")[:1000],
+            evidence=str(raw.get("evidence", "") or "")[:1000],
+            completeness=round(completeness, 2), rr_tp1=round(rr1, 3), rr_tp10=round(rr10, 3),
+            created_at=now_local().isoformat(),
+        )
+        setup.rank_score = _rank_video_trade_setup(setup)
+        setup.status = "COMPLETE" if entry > 0 and sl > 0 and tps else "PARTIAL"
+        result.append(setup)
+    result.sort(key=lambda x: (x.rank_score, x.confidence, x.rr_tp10), reverse=True)
+    return result
+
+
+def video_trade_summary(setups: List[VideoTradeSetup], limit: int = 10) -> str:
+    if not setups:
+        return "🎯 لم يتم العثور على صفقة محددة بأرقام يمكن التحقق منها داخل الفيديو."
+    lines = ["🎯 الصفقات المستخرجة من الفيديو — مرتبة من الأقوى إلى الأضعف", ""]
+    for i, s in enumerate(setups[:limit], 1):
+        entry = format_price(s.entry_price) if s.entry_price > 0 else "غير محدد"
+        sl = format_price(s.sl) if s.sl > 0 else "غير محدد"
+        tp1 = format_price(s.tps[0]) if s.tps else "غير محدد"
+        tp10 = format_price(s.tps[-1]) if s.tps else "غير محدد"
+        lines.append(
+            f"{i}. {s.asset_name} | {s.side} | Rank {s.rank_score}/100\n"
+            f"   Entry {entry} | SL {sl} | TP1 {tp1} | Last TP {tp10}\n"
+            f"   Confidence {s.confidence:.0f}% | Completeness {s.completeness:.0f}% | RR1 {s.rr_tp1:.2f} | RR10 {s.rr_tp10:.2f}\n"
+            f"   Timestamp {s.source_timestamp or '—'} | {s.status} | ID {s.id}"
+        )
+    return "\n\n".join(lines)
+
+
 async def process_strategy_video(message: types.Message, url: str, original_text: str):
     await safe_send(message, "🎥 تم اكتشاف رابط فيديو. أبدأ أولًا باستخراج الترجمة إن وجدت، وإذا لم توجد سأحلل الفيديو نفسه بصريًا وصوتيًا عبر Gemini...")
 
@@ -2490,6 +2757,45 @@ async def process_strategy_video(message: types.Message, url: str, original_text
 
     strategies_db["strategies"][strategy.id] = asdict(strategy)
     save_strategies()
+
+    # Extract the actual trade proposals shown in the video separately from the
+    # abstract strategy. This fixes the old gap where only the strategy was saved.
+    try:
+        setups = await extract_video_trade_setups(url, source)
+        async with video_trade_lock:
+            for setup in setups:
+                video_trade_setups[setup.id] = setup
+            if len(video_trade_setups) > VIDEO_TRADE_MAX * 10:
+                ranked = sorted(video_trade_setups.values(), key=lambda x: (x.rank_score, x.created_at), reverse=True)
+                video_trade_setups.clear()
+                video_trade_setups.update({x.id: x for x in ranked[:VIDEO_TRADE_MAX * 10]})
+            save_video_trade_setups()
+        if setups:
+            await safe_send(message, video_trade_summary(setups))
+        else:
+            await safe_send(message, "🎯 لم يستخرج الفيديو صفقة محددة بأرقام موثوقة؛ لن أخترع Entry/SL/TP.")
+
+        # A submitted video must also trigger an immediate reanalysis of the bot's
+        # own open trades for the assets explicitly found in the video.
+        affected_assets = {x.asset_key for x in setups}
+        if not affected_assets:
+            affected_assets = set(detect_assets_in_text(source))
+        affected_trades = [t for t in list(open_trades.values()) if t.status == "OPEN" and t.asset_key in affected_assets]
+        if affected_trades:
+            await safe_send(message, f"🔄 الفيديو مرتبط بـ {len(affected_trades)} صفقة مفتوحة. سأعيد تحليلها الآن وأفرزها حسب الأولوية.")
+            for t in affected_trades:
+                try:
+                    await reanalyze_trade(t, reason="video")
+                except Exception:
+                    logger.exception("Video-triggered reanalysis failed for %s", t.id)
+            affected_trades.sort(key=trade_priority_key, reverse=True)
+            lines = ["📋 ترتيب الصفقات بعد تحليل الفيديو:"]
+            for i, t in enumerate(affected_trades, 1):
+                lines.append(f"{i}. {t.asset_name} {t.side} | {t.id} | {t.management} | confidence {t.confidence:.0f}% | R {t.realized_r:.2f}")
+            await safe_send(message, "\n".join(lines))
+    except Exception as exc:
+        logger.exception("Video trade extraction failed")
+        await safe_send(message, f"⚠️ تم حفظ الاستراتيجية، لكن تعذر استخراج الصفقات منها: {str(exc)[:500]}")
 
     await safe_send(
         message,
@@ -2796,6 +3102,7 @@ async def main():
     migrate_legacy_json_to_persistence()
     load_state()
     load_strategies()
+    load_video_trade_setups()
     load_news_learning()
     if not get_twelve_data_api_key(): logger.warning("TWELVE_DATA_API_KEY is missing.")
     if not GEMINI_KEYS: logger.warning("No Gemini API keys configured.")
