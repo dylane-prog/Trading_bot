@@ -14,7 +14,7 @@ import sqlite3
 from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
 import aiohttp
