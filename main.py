@@ -781,37 +781,56 @@ _persistence_backend = "local"
 _instance_lock_conn = None
 _INSTANCE_LOCK_KEY = 8844303492
 
-def acquire_instance_lock() -> bool:
-    """Allow exactly one bot process to run when PostgreSQL persistence is active."""
+def acquire_instance_lock(wait_seconds: int = 180, retry_seconds: int = 5) -> bool:
+    """Allow exactly one Telegram poller, waiting through Render deploy overlap.
+
+    Render can start a replacement process before the previous process has
+    finished shutting down. A fail-fast lock makes the replacement exit and
+    can leave Render repeatedly restarting it. Instead, keep the health server
+    alive and wait for the old PostgreSQL session-scoped lock to disappear.
+    """
     global _instance_lock_conn
     if _instance_lock_conn is not None:
         return True
     if _persistence_backend != "postgres" or not DATABASE_URL or psycopg is None:
         logger.warning("Instance lock unavailable: PostgreSQL persistence is not active")
         return True
-    try:
-        conn = _pg_connect()
-        if conn is None:
-            return True
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (_INSTANCE_LOCK_KEY,))
-            acquired = bool(cur.fetchone()[0])
-        if not acquired:
-            conn.close()
-            logger.critical("Another Trading Bot instance already owns the PostgreSQL instance lock; refusing to start Telegram polling")
-            return False
-        _instance_lock_conn = conn
-        logger.info("PostgreSQL instance lock acquired")
-        return True
-    except Exception:
-        logger.exception("Failed to acquire PostgreSQL instance lock")
+
+    deadline = time.monotonic() + max(0, int(wait_seconds))
+    attempt = 0
+    while True:
+        attempt += 1
+        conn = None
         try:
-            if _instance_lock_conn is not None:
-                _instance_lock_conn.close()
+            conn = _pg_connect()
+            if conn is None:
+                return True
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (_INSTANCE_LOCK_KEY,))
+                acquired = bool(cur.fetchone()[0])
+            if acquired:
+                _instance_lock_conn = conn
+                logger.info("PostgreSQL instance lock acquired (attempt %d)", attempt)
+                return True
+            conn.close()
+            conn = None
+            remaining = max(0, int(deadline - time.monotonic()))
+            if remaining <= 0:
+                logger.critical("PostgreSQL instance lock is still owned after %ss; refusing to start Telegram polling", wait_seconds)
+                return False
+            logger.warning("Another Trading Bot instance owns the PostgreSQL lock; waiting %ss before retry (up to %ss)", retry_seconds, remaining)
+            time.sleep(min(max(1, int(retry_seconds)), remaining))
         except Exception:
-            pass
-        _instance_lock_conn = None
-        return False
+            logger.exception("Failed to acquire PostgreSQL instance lock")
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            # Do not spin forever on a broken database connection.
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(max(1, int(retry_seconds)), max(1, int(deadline - time.monotonic()))))
 
 def release_instance_lock():
     global _instance_lock_conn
@@ -3358,8 +3377,13 @@ async def start_web_server():
 # ============================================================
 async def main():
     init_persistence()
+    # Start the Render health endpoint before waiting for the singleton lock.
+    # This keeps the web service healthy while an old deployment is shutting down.
+    runner=await start_web_server()
     if not acquire_instance_lock():
-        logger.critical("Trading Bot startup aborted because another instance is already running")
+        logger.critical("Trading Bot startup aborted because PostgreSQL instance lock could not be acquired")
+        try: await runner.cleanup()
+        except Exception: pass
         return
     migrate_legacy_json_to_persistence()
     load_state()
@@ -3368,7 +3392,6 @@ async def main():
     load_news_learning()
     if not get_twelve_data_api_key(): logger.warning("TWELVE_DATA_API_KEY is missing.")
     if not GEMINI_KEYS: logger.warning("No Gemini API keys configured.")
-    runner=await start_web_server()
     monitor_task=asyncio.create_task(trade_monitor())
     keepalive_task=asyncio.create_task(self_ping_loop())
     try:
