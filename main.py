@@ -774,6 +774,60 @@ def dt_from_string(value: str) -> datetime:
 
 _persistence_initialized = False
 _persistence_backend = "local"
+# Cross-process singleton guard. Telegram getUpdates permits only one active
+# poller per bot token, so Render restarts/deploys must not allow two bot
+# processes to poll simultaneously. PostgreSQL advisory locks are session-scoped
+# and therefore remain held for the lifetime of this connection.
+_instance_lock_conn = None
+_INSTANCE_LOCK_KEY = 8844303492
+
+def acquire_instance_lock() -> bool:
+    """Allow exactly one bot process to run when PostgreSQL persistence is active."""
+    global _instance_lock_conn
+    if _instance_lock_conn is not None:
+        return True
+    if _persistence_backend != "postgres" or not DATABASE_URL or psycopg is None:
+        logger.warning("Instance lock unavailable: PostgreSQL persistence is not active")
+        return True
+    try:
+        conn = _pg_connect()
+        if conn is None:
+            return True
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (_INSTANCE_LOCK_KEY,))
+            acquired = bool(cur.fetchone()[0])
+        if not acquired:
+            conn.close()
+            logger.critical("Another Trading Bot instance already owns the PostgreSQL instance lock; refusing to start Telegram polling")
+            return False
+        _instance_lock_conn = conn
+        logger.info("PostgreSQL instance lock acquired")
+        return True
+    except Exception:
+        logger.exception("Failed to acquire PostgreSQL instance lock")
+        try:
+            if _instance_lock_conn is not None:
+                _instance_lock_conn.close()
+        except Exception:
+            pass
+        _instance_lock_conn = None
+        return False
+
+def release_instance_lock():
+    global _instance_lock_conn
+    conn = _instance_lock_conn
+    _instance_lock_conn = None
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(%s)", (_INSTANCE_LOCK_KEY,))
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def _pg_connect():
@@ -3304,6 +3358,9 @@ async def start_web_server():
 # ============================================================
 async def main():
     init_persistence()
+    if not acquire_instance_lock():
+        logger.critical("Trading Bot startup aborted because another instance is already running")
+        return
     migrate_legacy_json_to_persistence()
     load_state()
     load_strategies()
@@ -3331,6 +3388,7 @@ async def main():
         save_state()
         try: await runner.cleanup()
         except Exception: pass
+        release_instance_lock()
         await bot.session.close()
         logger.info("Trading Bot stopped")
 
