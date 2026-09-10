@@ -81,6 +81,8 @@ MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "30"))
 MIN_TRADE_DURATION_MINUTES = max(1, int(os.getenv("MIN_TRADE_DURATION_MINUTES", "1")))
 MAX_TRADE_DURATION_MINUTES = min(72 * 60, max(MIN_TRADE_DURATION_MINUTES, int(os.getenv("MAX_TRADE_DURATION_MINUTES", str(72 * 60)))))
 VIDEO_TRADE_MAX = max(1, min(50, int(os.getenv("VIDEO_TRADE_MAX", "20"))))
+VIDEO_MAX_ANALYSIS_SECONDS = max(60, int(os.getenv("VIDEO_MAX_ANALYSIS_SECONDS", "900")))
+VIDEO_MIN_CONFIDENCE = max(0.0, min(100.0, float(os.getenv("VIDEO_MIN_CONFIDENCE", "55"))))
 VIDEO_AGENTIC = os.getenv("VIDEO_AGENTIC", "true").lower() in ("1", "true", "yes", "on")
 SIGNAL_SCORE_THRESHOLD = max(1, int(os.getenv("SIGNAL_SCORE_THRESHOLD", "3")))
 # Market-close protection: trades are never allowed to outlive the next
@@ -686,6 +688,9 @@ class Trade:
     estimated_duration_minutes: int
     next_reanalysis_at: str
     market_close_at: str = ""
+    order_type: str = "MARKET"  # MARKET | BUY_LIMIT | SELL_LIMIT
+    pending: bool = False
+    activated_at: str = ""
     status: str = "OPEN"
     last_price: float = 0.0
     last_action: str = "OPENED"
@@ -1075,7 +1080,7 @@ def today_open_risk() -> float:
     today = now_local().date()
     total = 0.0
     for trade in open_trades.values():
-        if trade.status != "OPEN":
+        if trade.status not in ("OPEN", "PENDING"):
             continue
         try:
             if dt_from_string(trade.opened_at).date() == today:
@@ -1088,6 +1093,29 @@ def today_open_risk() -> float:
 def daily_risk_exposure() -> float:
     return today_realized_loss() + today_open_risk()
 
+
+def risk_gate_for_order(analysis: Analysis, side: str, order_type: str) -> Tuple[bool, str, dict]:
+    """Risk gate using the actual requested order entry/SL rather than the live
+    market price. This matters for BUY LIMIT/SELL LIMIT pending orders."""
+    entry, sl, tps = build_order_levels(analysis, side, order_type)
+    risk_amount = ACCOUNT_BALANCE * RISK_PER_TRADE_PCT / 100.0
+    stop_distance = abs(entry - sl)
+    position_size = risk_amount / max(stop_distance, 1e-12)
+    rr1 = abs(tps[0] - entry) / max(stop_distance, 1e-12)
+    rr10 = abs(tps[-1] - entry) / max(stop_distance, 1e-12)
+    if ACCOUNT_BALANCE <= 0: return False, "TRADING_ACCOUNT_BALANCE يجب أن يكون أكبر من صفر.", {}
+    if RISK_PER_TRADE_PCT <= 0: return False, "RISK_PER_TRADE_PCT يجب أن يكون أكبر من صفر.", {}
+    if MIN_RR > 0 and rr1 < MIN_RR:
+        return False, f"R:R إلى TP1 = {rr1:.2f} أقل من الحد {MIN_RR:.2f}.", {"risk_amount":risk_amount,"position_size":position_size,"rr_tp1":rr1,"rr_tp10":rr10}
+    open_after=current_open_risk()+risk_amount
+    max_open=ACCOUNT_BALANCE*MAX_TOTAL_OPEN_RISK_PCT/100.0
+    if MAX_TOTAL_OPEN_RISK_PCT>0 and open_after>max_open+1e-9:
+        return False, f"مخاطر الصفقات بعد الإضافة {open_after:.2f}$ تتجاوز الحد.", {"risk_amount":risk_amount,"position_size":position_size,"rr_tp1":rr1,"rr_tp10":rr10}
+    daily_after=daily_risk_exposure()+risk_amount
+    max_daily=ACCOUNT_BALANCE*DAILY_RISK_LIMIT_PCT/100.0
+    if DAILY_RISK_LIMIT_PCT>0 and daily_after>max_daily+1e-9:
+        return False, f"التعرض اليومي بعد الإضافة {daily_after:.2f}$ يتجاوز الحد.", {"risk_amount":risk_amount,"position_size":position_size,"rr_tp1":rr1,"rr_tp10":rr10}
+    return True,"OK",{"risk_amount":risk_amount,"position_size":position_size,"rr_tp1":rr1,"rr_tp10":rr10}
 
 def risk_gate(analysis: Analysis) -> Tuple[bool, str, dict]:
     risk_amount, position_size, rr_tp1, rr_tp10 = calculate_trade_risk(analysis)
@@ -1169,25 +1197,60 @@ def mark_trade_closed(trade: Trade, price: float, action: str, status: str = "CL
     trade.realized_r = trade.realized_pnl / initial_risk
 
 
-def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None) -> Trade:
+def build_order_levels(analysis: Analysis, side: str, order_type: str = "MARKET") -> Tuple[float, float, List[float]]:
+    """Build a deterministic paper-trade order plan. LIMIT entries are offset from
+    live price by 0.50 ATR and all SL/TP levels are derived from that entry."""
+    atr_v = max(float(analysis.atr_value), 1e-12)
+    live = float(analysis.price)
+    side = side.upper()
+    order_type = order_type.upper()
+    if order_type == "BUY_LIMIT":
+        entry = live - 0.50 * atr_v
+    elif order_type == "SELL_LIMIT":
+        entry = live + 0.50 * atr_v
+    else:
+        entry = live
+    sl = entry - 1.20 * atr_v if side == "BUY" else entry + 1.20 * atr_v
+    multipliers = (0.8, 1.2, 1.6, 2.0, 2.4, 2.8, 3.2, 3.6, 4.0, 4.5)
+    tps = [entry + atr_v*m for m in multipliers] if side == "BUY" else [entry - atr_v*m for m in multipliers]
+    return entry, sl, tps
+
+def apply_trade_mode(analysis: Analysis, mode: str) -> Analysis:
+    """Apply the user's horizon preference without replacing the dynamic engine."""
+    mode = (mode or "dynamic").lower()
+    if analysis.signal not in ("BUY", "SELL"):
+        return analysis
+    if mode == "quick":
+        analysis.duration_minutes = max(1, min(60, analysis.duration_minutes or 15))
+    elif mode == "long":
+        analysis.duration_minutes = max(240, min(MAX_TRADE_DURATION_MINUTES, max(analysis.duration_minutes, 240)))
+    else:
+        analysis.duration_minutes = max(MIN_TRADE_DURATION_MINUTES, min(MAX_TRADE_DURATION_MINUTES, analysis.duration_minutes))
+    return analysis
+
+def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None, order_type: str = "MARKET", side_override: Optional[str] = None) -> Trade:
     now = now_local()
+    side = (side_override or analysis.signal).upper()
+    order_type = order_type.upper()
+    entry, sl, tps = build_order_levels(analysis, side, order_type)
     mins = max(1, round(analysis.duration_minutes * REANALYSIS_PERCENT))
+    pending = order_type in ("BUY_LIMIT", "SELL_LIMIT")
     expiry, expiry_reason = calculate_trade_expiry(now, analysis.duration_minutes, analysis.asset_key)
     market_close = next_market_close(analysis.asset_key, now)
     size = float((risk or {}).get("position_size", 0.0))
     return Trade(
         id=uuid.uuid4().hex[:8].upper(), chat_id=chat_id,
         asset_key=analysis.asset_key, asset_name=analysis.asset_name, symbol=analysis.symbol,
-        side=analysis.signal, entry_low=analysis.entry_low, entry_high=analysis.entry_high,
-        entry_price=analysis.price, sl=analysis.sl, tps=list(analysis.tps),
+        side=side, entry_low=entry, entry_high=entry, entry_price=entry, sl=sl, tps=list(tps),
         opened_at=now.isoformat(), estimated_duration_minutes=analysis.duration_minutes,
         next_reanalysis_at=(now + timedelta(minutes=mins)).isoformat(),
         market_close_at=market_close.isoformat() if market_close else "",
-        status="OPEN", last_price=analysis.price, score=analysis.score, confidence=analysis.confidence,
+        order_type=order_type, pending=pending, activated_at="",
+        status="PENDING" if pending else "OPEN", last_price=analysis.price, score=analysis.score, confidence=analysis.confidence,
         risk_percent=RISK_PER_TRADE_PCT, risk_amount=float((risk or {}).get("risk_amount", 0.0)),
         position_size=size, remaining_position_size=size,
-        rr_tp1=float((risk or {}).get("rr_tp1", 0.0)), rr_tp10=float((risk or {}).get("rr_tp10", 0.0)),
-        tp_allocations=list(TP_ALLOCATION), break_even_price=analysis.price, peak_price=analysis.price,
+        rr_tp1=abs(tps[0]-entry)/max(abs(entry-sl),1e-12), rr_tp10=abs(tps[-1]-entry)/max(abs(entry-sl),1e-12),
+        tp_allocations=list(TP_ALLOCATION), break_even_price=entry, peak_price=entry,
         expiry_at=expiry.isoformat(), expiry_reason=expiry_reason,
     )
 
@@ -1195,7 +1258,7 @@ def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None) 
 def trade_status_text(trade: Trade) -> str:
     next_time = dt_from_string(trade.next_reanalysis_at).strftime("%Y-%m-%d %H:%M:%S")
     reached = ", ".join(f"TP{x}" for x in trade.hit_tps) if trade.hit_tps else "none"
-    return (f"{trade.asset_name} | {trade.side} | {trade.status}\nID: {trade.id}\n"
+    return (f"{trade.asset_name} | {trade.side} | {trade.status} | {trade.order_type}\nID: {trade.id}\n"
             f"Entry: {format_price(trade.entry_price)}\nSL: {format_price(trade.sl)}\n"
             f"Last price: {format_price(trade.last_price)}\nRisk: {trade.risk_amount:.2f}$ ({trade.risk_percent:.2f}%)\n"
             f"Initial size: {trade.position_size:.6f} | Remaining: {trade.remaining_position_size:.6f}\n"
@@ -1206,7 +1269,7 @@ def trade_status_text(trade: Trade) -> str:
 
 
 def trade_expired(trade: Trade, now: Optional[datetime] = None) -> bool:
-    if trade.status != "OPEN": return False
+    if trade.status not in ("OPEN", "PENDING"): return False
     now = now or now_local()
     opened = dt_from_string(trade.opened_at)
     expiry, reason = calculate_trade_expiry(opened, trade.estimated_duration_minutes, trade.asset_key)
@@ -1219,6 +1282,21 @@ def trade_expired(trade: Trade, now: Optional[datetime] = None) -> bool:
 
 def evaluate_trade_price(trade: Trade, price: float, atr_value: Optional[float] = None) -> List[str]:
     events=[]; trade.last_price=float(price)
+    if trade.status not in ("OPEN", "PENDING"): return events
+    # Pending LIMIT orders become active only after the live price reaches the entry.
+    if trade.pending:
+        touched = (trade.side == "BUY" and price <= trade.entry_price) or (trade.side == "SELL" and price >= trade.entry_price)
+        if not touched:
+            return events
+        trade.pending = False
+        trade.status = "OPEN"
+        trade.activated_at = now_local().isoformat()
+        trade.opened_at = trade.activated_at
+        expiry, reason = calculate_trade_expiry(now_local(), trade.estimated_duration_minutes, trade.asset_key)
+        trade.expiry_at, trade.expiry_reason = expiry.isoformat(), reason
+        trade.next_reanalysis_at = (now_local() + timedelta(minutes=max(1, round(trade.estimated_duration_minutes * REANALYSIS_PERCENT)))).isoformat()
+        trade.last_action = f"{trade.order_type} FILLED"
+        events.append("LIMIT FILLED")
     if trade.status != "OPEN": return events
     if trade.side == "BUY":
         trade.peak_price=max(trade.peak_price, price)
@@ -1378,6 +1456,7 @@ def main_keyboard():
         [types.InlineKeyboardButton(text="💶 EUR/USD",callback_data="asset:eurusd"),types.InlineKeyboardButton(text="🥈 Silver",callback_data="asset:silver")],
         [types.InlineKeyboardButton(text="🛢 Oil",callback_data="asset:oil"),types.InlineKeyboardButton(text="Ξ ETH",callback_data="asset:eth")],
         [types.InlineKeyboardButton(text="📋 Open Trades",callback_data="trades"),types.InlineKeyboardButton(text="🎯 Video Trades",callback_data="video_trades")],
+        [types.InlineKeyboardButton(text="⚡ Quick Trade",callback_data="mode_menu:quick"),types.InlineKeyboardButton(text="🕐 Long Trade",callback_data="mode_menu:long")],
         [types.InlineKeyboardButton(text="⚙️ Status",callback_data="status")],
         [types.InlineKeyboardButton(text="🛡 Risk",callback_data="risk"),types.InlineKeyboardButton(text="🧠 Strategies",callback_data="strategies")],
         [types.InlineKeyboardButton(text="🧪 Training",callback_data="training"),types.InlineKeyboardButton(text="🏆 Ranking",callback_data="ranking")],
@@ -1407,37 +1486,74 @@ async def cb_asset(call: types.CallbackQuery):
     try:
         analysis,_=await get_market_snapshot(asset); ai=await improve_analysis_with_ai(analysis)
         text=analysis_message(analysis,ai)
-        buttons=[[types.InlineKeyboardButton(text="🟢 فتح صفقة ورقية",callback_data=f"open:{asset}")]] if analysis.signal in ("BUY","SELL") and analysis.confidence>=MIN_CONFIDENCE_TO_OPEN else []
+        buttons=[]
+        if analysis.signal in ("BUY","SELL") and analysis.confidence>=MIN_CONFIDENCE_TO_OPEN:
+            buttons.append([types.InlineKeyboardButton(text="⚡ صفقة سريعة",callback_data=f"mode:quick:{asset}"), types.InlineKeyboardButton(text="🕐 صفقة طويلة",callback_data=f"mode:long:{asset}")])
+            buttons.append([types.InlineKeyboardButton(text="🟢 Market",callback_data=f"open:market:{asset}:dynamic"), types.InlineKeyboardButton(text="🟡 BUY LIMIT",callback_data=f"open:buy_limit:{asset}:dynamic"), types.InlineKeyboardButton(text="🔴 SELL LIMIT",callback_data=f"open:sell_limit:{asset}:dynamic")])
         buttons += [[types.InlineKeyboardButton(text="🔄 إعادة التحليل",callback_data=f"asset:{asset}")],[types.InlineKeyboardButton(text="⬅️ Home",callback_data="menu")]]
         await call.message.edit_text(text,reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons))
     except Exception as exc:
         await call.message.edit_text(f"❌ فشل التحليل: {str(exc)[:700]}",reply_markup=main_keyboard())
 
-@dp.callback_query(F.data.startswith("open:"))
-async def cb_open(call: types.CallbackQuery):
-    await call.answer("فتح الصفقة...")
-    asset=call.data.split(":",1)[1]
+@dp.callback_query(F.data.startswith("mode_menu:"))
+async def cb_mode_menu(call: types.CallbackQuery):
+    await call.answer()
+    mode=call.data.split(":",1)[1]
+    label="⚡ صفقة سريعة" if mode=="quick" else "🕐 صفقة طويلة"
+    rows=[]
+    for key,cfg in ASSETS.items():
+        rows.append(types.InlineKeyboardButton(text=cfg["name"],callback_data=f"mode:{mode}:{key}"))
+    keyboard=[rows[i:i+2] for i in range(0,len(rows),2)]
+    keyboard.append([types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")])
+    await call.message.edit_text(f"{label}\n\nاختر الأصل:",reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+@dp.callback_query(F.data.startswith("mode:"))
+async def cb_trade_mode(call: types.CallbackQuery):
+    await call.answer("اختيار المدة...")
+    _, mode, asset = call.data.split(":", 2)
     if asset not in ASSETS: return
     try:
         analysis,_=await get_market_snapshot(asset)
-        if analysis.signal not in ("BUY","SELL") or analysis.confidence<MIN_CONFIDENCE_TO_OPEN:
+        apply_trade_mode(analysis, mode)
+        ai=await improve_analysis_with_ai(analysis)
+        text=analysis_message(analysis,ai)
+        buttons=[[types.InlineKeyboardButton(text="🟢 Market",callback_data=f"open:market:{asset}:{mode}"), types.InlineKeyboardButton(text="🟡 BUY LIMIT",callback_data=f"open:buy_limit:{asset}:{mode}"), types.InlineKeyboardButton(text="🔴 SELL LIMIT",callback_data=f"open:sell_limit:{asset}:{mode}")], [types.InlineKeyboardButton(text="⚡ Quick",callback_data=f"mode:quick:{asset}"),types.InlineKeyboardButton(text="🕐 Long",callback_data=f"mode:long:{asset}")],[types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]]
+        await call.message.edit_text(text, reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    except Exception as exc:
+        await call.message.edit_text(f"❌ فشل إعداد نمط الصفقة: {str(exc)[:700]}", reply_markup=main_keyboard())
+
+@dp.callback_query(F.data.startswith("open:"))
+async def cb_open(call: types.CallbackQuery):
+    await call.answer("تجهيز الصفقة...")
+    parts=call.data.split(":")
+    order_type=parts[1].upper() if len(parts)>2 else "MARKET"
+    asset=parts[2] if len(parts)>2 else parts[1]
+    mode=parts[3].lower() if len(parts)>3 else "dynamic"
+    if asset not in ASSETS: return
+    try:
+        analysis,_=await get_market_snapshot(asset)
+        apply_trade_mode(analysis, mode)
+        if order_type == "BUY_LIMIT": side_override="BUY"
+        elif order_type == "SELL_LIMIT": side_override="SELL"
+        else: side_override=None
+        if side_override is None and (analysis.signal not in ("BUY","SELL") or analysis.confidence<MIN_CONFIDENCE_TO_OPEN):
             await call.message.edit_text("⚠️ لم تعد الإشارة مؤهلة لفتح صفقة.",reply_markup=main_keyboard()); return
         async with trade_lock:
-            if any(t.asset_key==asset and t.status=="OPEN" for t in open_trades.values()):
+            if any(t.asset_key==asset and t.status in ("OPEN","PENDING") for t in open_trades.values()):
                 await call.message.edit_text("⚠️ توجد صفقة مفتوحة لهذا الأصل بالفعل.",reply_markup=main_keyboard()); return
-            if sum(t.status=="OPEN" for t in open_trades.values())>=MAX_OPEN_TRADES:
+            if sum(t.status in ("OPEN","PENDING") for t in open_trades.values())>=MAX_OPEN_TRADES:
                 await call.message.edit_text("⚠️ تم الوصول إلى الحد الأقصى للصفقات المفتوحة.",reply_markup=main_keyboard()); return
-            ok,reason,risk=risk_gate(analysis)
+            ok,reason,risk=risk_gate_for_order(analysis, side_override or analysis.signal, order_type)
             if not ok:
                 await call.message.edit_text(f"🛡️ لم تُفتح الصفقة بسبب إدارة المخاطر:\n{reason}",reply_markup=main_keyboard()); return
-            trade=create_trade(call.message.chat.id,analysis,risk); open_trades[trade.id]=trade; save_state()
+            trade=create_trade(call.message.chat.id,analysis,risk,order_type=order_type,side_override=side_override); open_trades[trade.id]=trade; save_state()
         await call.message.edit_text(trade_status_text(trade),reply_markup=trade_keyboard(trade))
     except Exception as exc:
         await call.message.edit_text(f"❌ فشل فتح الصفقة: {str(exc)[:700]}",reply_markup=main_keyboard())
 
 @dp.callback_query(F.data == "status")
 async def cb_status(call: types.CallbackQuery):
-    await call.answer(); open_count=sum(t.status=="OPEN" for t in open_trades.values())
+    await call.answer(); open_count=sum(t.status in ("OPEN","PENDING") for t in open_trades.values())
     text=(f"⚙️ Status\n\nTelegram: ONLINE\nTwelve Data: {'CONFIGURED' if get_twelve_data_api_key() else 'MISSING'}\nGemini keys: {len(GEMINI_KEYS)}\nOpen trades: {open_count}/{MAX_OPEN_TRADES}\nRisk/trade: {RISK_PER_TRADE_PCT:.2f}%\nOpen risk: {current_open_risk():.2f}$\nDaily exposure: {daily_risk_exposure():.2f}$\nMonitor: {MONITOR_SECONDS}s\nDuration: {MIN_TRADE_DURATION_MINUTES}m → {MAX_TRADE_DURATION_MINUTES}m\nTraining minimum: {STRATEGY_MIN_TRADES} actual trades")
     await call.message.edit_text(text,reply_markup=main_keyboard())
 
@@ -1447,7 +1563,7 @@ async def cb_risk(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "trades")
 async def cb_trades(call: types.CallbackQuery):
-    await call.answer(); trades=[t for t in open_trades.values() if t.status=="OPEN"]
+    await call.answer(); trades=[t for t in open_trades.values() if t.status in ("OPEN","PENDING")]
     if not trades: await call.message.edit_text("📋 لا توجد صفقات مفتوحة.",reply_markup=main_keyboard()); return
     trades.sort(key=trade_priority_key, reverse=True)
     kb=[[types.InlineKeyboardButton(text="🔄 Reanalyze ALL",callback_data="reanalyze_all")]]
@@ -2205,6 +2321,11 @@ trade_setups: [
 في trade_setups أدرج فقط الصفقات التي شاهدت أو سمعت تفاصيلها فعلاً.
 إذا لم يذكر الفيديو سعر الدخول/SL/TP، اتركه null ولا تخمّن.
 إذا ظهرت صفقة متعددة الأهداف، احتفظ بكل الأهداف التي أمكن قراءتها.
+
+إذا لم تظهر أرقام Entry/SL/TP بوضوح لكن الفيديو يشرح اتجاهًا أو قاعدة دخول قابلة للتنفيذ، أضف أيضًا
+إلى JSON حقل video_trade_candidates بقيم: asset, side, entry_type (MARKET|BUY_LIMIT|SELL_LIMIT),
+entry_hint, sl_hint, tp_hint, duration_minutes, confidence, rationale, evidence_timestamp.
+هذه ليست صفقة مستخرجة مؤكدة؛ هي إشارة مستندة إلى ما شوهد/سُمع فقط، ويجب أن تكون صريحة بهذا الوصف.
 """
 
 
@@ -2654,6 +2775,69 @@ def _rank_video_trade_setup(setup: VideoTradeSetup) -> float:
     return round(min(100.0, score), 2)
 
 
+def _candidate_to_setup(raw: dict, source_url: str) -> Optional[VideoTradeSetup]:
+    asset_key=_video_asset_key(raw.get("asset")); side=str(raw.get("side","")).upper().strip()
+    if asset_key not in ASSETS or side not in ("BUY","SELL"): return None
+    entry=_safe_float(raw.get("entry"),0.0); sl=_safe_float(raw.get("sl"),0.0)
+    tps=[_safe_float(raw.get(f"tp{i}"),0.0) for i in range(1,11)]
+    tps=[x for x in tps if x>0]
+    duration=max(0,int(_safe_float(raw.get("duration_minutes"),0)))
+    conf=max(0.0,min(100.0,_safe_float(raw.get("confidence"),0.0)))
+    setup=VideoTradeSetup(id=uuid.uuid4().hex[:10].upper(),source_url=source_url,source_timestamp=str(raw.get("timestamp",raw.get("evidence_timestamp","")) or ""),asset_key=asset_key,asset_name=ASSETS[asset_key]["name"],side=side,entry_price=entry,sl=sl,tps=tps,duration_minutes=duration,confidence=conf,rationale=str(raw.get("rationale","") or "")[:1000],evidence=str(raw.get("evidence",raw.get("entry_hint","")) or "")[:1000],created_at=now_local().isoformat())
+    complete=(entry>0 and sl>0 and bool(tps))
+    setup.completeness=100.0 if complete else 45.0
+    setup.rr_tp1=abs(tps[0]-entry)/max(abs(entry-sl),1e-12) if complete else 0.0
+    setup.rr_tp10=abs(tps[-1]-entry)/max(abs(entry-sl),1e-12) if complete else 0.0
+    setup.rank_score=_rank_video_trade_setup(setup)
+    setup.status="COMPLETE" if complete else "CANDIDATE"
+    return setup
+
+def _rescue_video_trade_candidates(text: str) -> List[dict]:
+    """Deterministic second-pass extraction for common trade lines emitted by
+    multimodal models. It never invents missing values; every numeric value must
+    appear in the source text."""
+    if not text: return []
+    out=[]
+    asset_patterns={
+        "btc":r"(?:bitcoin|btc|xbt|بتكوين|بيتكوين)",
+        "gold":r"(?:gold|xau/?usd|xau|ذهب)",
+        "eurusd":r"(?:eur/?usd|eurusd|euro|اليورو)",
+        "silver":r"(?:silver|xag/?usd|xag|فضة)",
+        "oil":r"(?:oil|wti|crude|نفط)",
+        "eth":r"(?:ethereum|eth|ايثيريوم|إيثيريوم)",
+    }
+    for key,pat in asset_patterns.items():
+        for m in re.finditer(rf"(?is)(?:{pat}).{{0,900}}?(?:\b(BUY|SELL)\b|\b(شراء|بيع)\b).{{0,900}}", text):
+            block=m.group(0); side="BUY" if (m.group(1) or "").upper()=="BUY" or "شراء" in (m.group(2) or "") else "SELL"
+            nums=[float(x.replace(",","")) for x in re.findall(r"(?<![A-Za-z])\d{1,7}(?:,\d{3})*(?:\.\d+)?",block)]
+            if len(nums)<2: continue
+            # Prefer labelled values; fall back only to ordered numbers that are
+            # actually present in the same evidence block.
+            def labelled(names):
+                pat2=r"(?i)(?:"+"|".join(names)+r")\s*[:=@-]?\s*(\d{1,7}(?:,\d{3})*(?:\.\d+)?)"
+                mm=re.search(pat2,block)
+                return float(mm.group(1).replace(",","")) if mm else 0.0
+            entry=labelled(["entry","entry price","الدخول","دخول","limit"])
+            sl=labelled(["sl","stop loss","stop","وقف الخسارة","وقف"])
+            tps=[]
+            for i in range(1,11):
+                v=labelled([f"tp{i}",f"tp {i}",f"target {i}",f"هدف {i}"])
+                if v>0: tps.append(v)
+            if entry<=0 and nums: entry=nums[0]
+            if sl<=0 and len(nums)>1: sl=nums[1]
+            if not tps and len(nums)>2: tps=nums[2:12]
+            out.append({"asset":key,"side":side,"entry":entry or None,"sl":sl or None,**{f"tp{i}":(tps[i-1] if i<=len(tps) else None) for i in range(1,11)},"confidence":80,"rationale":"تم استخراجها من نص/تحليل الفيديو في تمريرة إنقاذ حتمية.","evidence":block[:1000]})
+    # If no explicit numeric setup was recoverable, preserve a directional
+    # candidate so the live engine can create a clearly labelled paper plan.
+    if not out:
+        low=text.lower()
+        for key,pat in asset_patterns.items():
+            if re.search(pat,low):
+                side="BUY" if re.search(r"\bBUY\b|\bشراء\b",text,re.I) else ("SELL" if re.search(r"\bSELL\b|\bبيع\b",text,re.I) else "")
+                if side:
+                    out.append({"asset":key,"side":side,"entry":None,"sl":None,"duration_minutes":None,"confidence":65,"rationale":"اتجاه الصفقة ظهر في محتوى الفيديو لكن أرقام Entry/SL/TP لم تكن قابلة للقراءة؛ سيُنشئ البوت مستويات السوق الحالية ويضع عليها وسمًا واضحًا.","evidence":"اتجاه مستخرج من محتوى الفيديو دون اختلاق أرقام."})
+    return out[:VIDEO_TRADE_MAX]
+
 async def extract_video_trade_setups(source_url: str, source_text: str) -> List[VideoTradeSetup]:
     # First reuse the structured JSON already returned by the multimodal video
     # analysis. This avoids a second Gemini call and prevents losing trades when
@@ -2661,6 +2845,8 @@ async def extract_video_trade_setups(source_url: str, source_text: str) -> List[
     # ask Gemini's text model to extract the setups from the visual-analysis text.
     embedded = extract_json_from_ai(source_text) or {}
     rows = embedded.get("trade_setups") if isinstance(embedded.get("trade_setups"), list) else embedded.get("trades")
+    if not isinstance(rows, list) and isinstance(embedded.get("video_trade_candidates"), list):
+        rows = embedded.get("video_trade_candidates")
     if not isinstance(rows, list):
         rows = None
 
@@ -2687,6 +2873,7 @@ async def extract_video_trade_setups(source_url: str, source_text: str) -> List[
         ai = await safe_ai_generate(prompt)
         obj = extract_json_from_ai(ai) or {}
         rows = obj.get("trades") if isinstance(obj.get("trades"), list) else obj.get("trade_setups")
+        if not isinstance(rows, list): rows = obj.get("video_trade_candidates")
         if not isinstance(rows, list):
             rows = []
     result: List[VideoTradeSetup] = []
@@ -2752,6 +2939,7 @@ def video_trade_summary(setups: List[VideoTradeSetup], limit: int = 10) -> str:
             f"   Entry {entry} | SL {sl} | TP1 {tp1} | Last TP {tp10}\n"
             f"   Confidence {s.confidence:.0f}% | Completeness {s.completeness:.0f}% | RR1 {s.rr_tp1:.2f} | RR10 {s.rr_tp10:.2f}\n"
             f"   Timestamp {s.source_timestamp or '—'} | {s.status} | ID {s.id}"
+            + (f"\n   🔄 المراجعة القادمة: {dt_from_string(s.next_reanalysis_at).strftime('%H:%M:%S')}" if s.next_reanalysis_at else "")
         )
     return "\n\n".join(lines)
 
@@ -2882,6 +3070,23 @@ async def process_strategy_video(message: types.Message, url: str, original_text
         logger.exception("Video trade extraction failed: %s", exc)
         _record_video_error(exc)
 
+    # If the video gave a directional candidate but no reliable prices, generate a clearly
+    # labelled paper-trade plan from the current market. This never pretends those prices
+    # came from the video; it uses only the video direction + current ATR.
+    if setups:
+        for setup in setups:
+            if setup.status == "CANDIDATE" and setup.entry_price <= 0:
+                try:
+                    live,_=await get_market_snapshot(setup.asset_key)
+                    order_type = "BUY_LIMIT" if setup.side=="BUY" else "SELL_LIMIT"
+                    setup.entry_price, setup.sl, setup.tps = build_order_levels(live, setup.side, order_type)
+                    setup.duration_minutes = setup.duration_minutes or live.duration_minutes or 60
+                    setup.completeness = 70.0
+                    setup.evidence = (setup.evidence + " | مستويات الدخول/SL/TP مولدة من السوق الحالي وليست من الفيديو.")[:1000]
+                    setup.rank_score = _rank_video_trade_setup(setup)
+                    setup.status = "VIDEO-CANDIDATE / LIVE LEVELS"
+                except Exception as exc: logger.warning("Could not complete video candidate %s: %s", setup.id, exc)
+
     strategy = await convert_content_to_strategy(url, source)
     if strategy:
         strategies_db["strategies"][strategy.id] = asdict(strategy)
@@ -2912,7 +3117,7 @@ async def process_strategy_video(message: types.Message, url: str, original_text
             if next_times:
                 await safe_send(message, f"🔄 تمت إعادة تحليل صفقات الفيديو الآن. المراجعة القادمة تلقائيًا بعد 10% من المدة — أقرب موعد: {min(next_times)}")
         else:
-            await safe_send(message, "🎯 لم يستخرج الفيديو صفقة محددة بأرقام موثوقة؛ لن أخترع Entry/SL/TP.")
+            await safe_send(message, "🎯 لم أجد أرقام Entry/SL/TP موثوقة داخل محتوى الفيديو. سأحتفظ بأي اتجاه/أصل واضح فقط كـ Video Candidate، وإذا لم يوجد حتى اتجاه واضح فلن أنشئ صفقة.")
 
         # A submitted video must also trigger an immediate reanalysis of the bot's
         # own open trades for the assets explicitly found in the video.
