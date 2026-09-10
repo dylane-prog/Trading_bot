@@ -80,6 +80,11 @@ PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "8"))
 MONITOR_SECONDS = int(os.getenv("MONITOR_SECONDS", "30"))
 MIN_TRADE_DURATION_MINUTES = max(1, int(os.getenv("MIN_TRADE_DURATION_MINUTES", "1")))
 MAX_TRADE_DURATION_MINUTES = min(72 * 60, max(MIN_TRADE_DURATION_MINUTES, int(os.getenv("MAX_TRADE_DURATION_MINUTES", str(72 * 60)))))
+VIDEO_TRADE_MAX = max(1, min(50, int(os.getenv("VIDEO_TRADE_MAX", "20"))))
+VIDEO_MAX_ANALYSIS_SECONDS = max(60, int(os.getenv("VIDEO_MAX_ANALYSIS_SECONDS", "900")))
+VIDEO_MIN_CONFIDENCE = max(0.0, min(100.0, float(os.getenv("VIDEO_MIN_CONFIDENCE", "55"))))
+VIDEO_AGENTIC = os.getenv("VIDEO_AGENTIC", "true").lower() in ("1", "true", "yes", "on")
+SIGNAL_SCORE_THRESHOLD = max(1, int(os.getenv("SIGNAL_SCORE_THRESHOLD", "3")))
 # Market-close protection: trades are never allowed to outlive the next
 # configured market close. Times are UTC. Crypto is 24/7 and has no close.
 MARKET_CLOSE_PROTECTION = os.getenv("MARKET_CLOSE_PROTECTION", "true").lower() in ("1", "true", "yes", "on")
@@ -552,7 +557,7 @@ def analyze_market(asset_key: str, candles: List[dict], live_price: Optional[flo
     elif momentum < 0:
         score -= 1; reasons.append("الزخم القصير سلبي")
 
-    signal = "BUY" if score >= 4 else "SELL" if score <= -4 else "NO TRADE"
+    signal = "BUY" if score >= SIGNAL_SCORE_THRESHOLD else "SELL" if score <= -SIGNAL_SCORE_THRESHOLD else "NO TRADE"
     confidence = min(95.0, max(35.0, 50.0 + abs(score) * 7.0))
     half = a * 0.20
     entry_low, entry_high = price - half, price + half
@@ -683,6 +688,9 @@ class Trade:
     estimated_duration_minutes: int
     next_reanalysis_at: str
     market_close_at: str = ""
+    order_type: str = "MARKET"  # MARKET | BUY_LIMIT | SELL_LIMIT
+    pending: bool = False
+    activated_at: str = ""
     status: str = "OPEN"
     last_price: float = 0.0
     last_action: str = "OPENED"
@@ -714,6 +722,39 @@ class Trade:
 
 open_trades: Dict[str, Trade] = {}
 trade_lock = asyncio.Lock()
+
+@dataclass
+class VideoTradeSetup:
+    id: str
+    source_url: str
+    source_timestamp: str
+    asset_key: str
+    asset_name: str
+    side: str
+    entry_price: float
+    sl: float
+    tps: List[float]
+    duration_minutes: int
+    confidence: float
+    rationale: str
+    evidence: str = ""
+    completeness: float = 0.0
+    rr_tp1: float = 0.0
+    rr_tp10: float = 0.0
+    rank_score: float = 0.0
+    status: str = "EXTRACTED"
+    created_at: str = ""
+    chat_id: int = 0
+    next_reanalysis_at: str = ""
+    last_reanalysis_at: str = ""
+    last_live_price: float = 0.0
+    live_signal: str = ""
+    live_confidence: float = 0.0
+    live_score: int = 0
+    last_reanalysis_note: str = ""
+
+video_trade_setups: Dict[str, VideoTradeSetup] = {}
+video_trade_lock = asyncio.Lock()
 
 
 def now_local() -> datetime:
@@ -858,6 +899,56 @@ def migrate_legacy_json_to_persistence():
                 logger.exception("Legacy news migration failed")
 
 
+def save_video_trade_setups():
+    try:
+        data = {k: asdict(v) for k, v in video_trade_setups.items()}
+        if _persistent_set("video_trade_setups", data):
+            return
+        tmp = "video_trade_setups.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, "video_trade_setups.json")
+    except Exception:
+        logger.exception("Could not save video trade setups")
+
+
+def load_video_trade_setups():
+    global video_trade_setups
+    try:
+        data = _persistent_get("video_trade_setups")
+        if data is None and os.path.exists("video_trade_setups.json"):
+            with open("video_trade_setups.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        for sid, raw in data.items():
+            if not isinstance(raw, dict):
+                continue
+            raw.setdefault("source_timestamp", "")
+            raw.setdefault("evidence", "")
+            raw.setdefault("completeness", 0.0)
+            raw.setdefault("rr_tp1", 0.0)
+            raw.setdefault("rr_tp10", 0.0)
+            raw.setdefault("rank_score", 0.0)
+            raw.setdefault("status", "EXTRACTED")
+            raw.setdefault("created_at", now_local().isoformat())
+            raw.setdefault("chat_id", 0)
+            raw.setdefault("next_reanalysis_at", "")
+            raw.setdefault("last_reanalysis_at", "")
+            raw.setdefault("last_live_price", 0.0)
+            raw.setdefault("live_signal", "")
+            raw.setdefault("live_confidence", 0.0)
+            raw.setdefault("live_score", 0)
+            raw.setdefault("last_reanalysis_note", "")
+            try:
+                video_trade_setups[sid] = VideoTradeSetup(**raw)
+            except Exception:
+                logger.warning("Skipping invalid video trade setup %s", sid)
+        logger.info("Loaded %s video trade setups from %s", len(video_trade_setups), persistence_status())
+    except Exception:
+        logger.exception("Could not load video trade setups")
+
+
 def save_state():
     try:
         data = {k: asdict(v) for k, v in open_trades.items()}
@@ -989,7 +1080,7 @@ def today_open_risk() -> float:
     today = now_local().date()
     total = 0.0
     for trade in open_trades.values():
-        if trade.status != "OPEN":
+        if trade.status not in ("OPEN", "PENDING"):
             continue
         try:
             if dt_from_string(trade.opened_at).date() == today:
@@ -1002,6 +1093,29 @@ def today_open_risk() -> float:
 def daily_risk_exposure() -> float:
     return today_realized_loss() + today_open_risk()
 
+
+def risk_gate_for_order(analysis: Analysis, side: str, order_type: str) -> Tuple[bool, str, dict]:
+    """Risk gate using the actual requested order entry/SL rather than the live
+    market price. This matters for BUY LIMIT/SELL LIMIT pending orders."""
+    entry, sl, tps = build_order_levels(analysis, side, order_type)
+    risk_amount = ACCOUNT_BALANCE * RISK_PER_TRADE_PCT / 100.0
+    stop_distance = abs(entry - sl)
+    position_size = risk_amount / max(stop_distance, 1e-12)
+    rr1 = abs(tps[0] - entry) / max(stop_distance, 1e-12)
+    rr10 = abs(tps[-1] - entry) / max(stop_distance, 1e-12)
+    if ACCOUNT_BALANCE <= 0: return False, "TRADING_ACCOUNT_BALANCE يجب أن يكون أكبر من صفر.", {}
+    if RISK_PER_TRADE_PCT <= 0: return False, "RISK_PER_TRADE_PCT يجب أن يكون أكبر من صفر.", {}
+    if MIN_RR > 0 and rr1 < MIN_RR:
+        return False, f"R:R إلى TP1 = {rr1:.2f} أقل من الحد {MIN_RR:.2f}.", {"risk_amount":risk_amount,"position_size":position_size,"rr_tp1":rr1,"rr_tp10":rr10}
+    open_after=current_open_risk()+risk_amount
+    max_open=ACCOUNT_BALANCE*MAX_TOTAL_OPEN_RISK_PCT/100.0
+    if MAX_TOTAL_OPEN_RISK_PCT>0 and open_after>max_open+1e-9:
+        return False, f"مخاطر الصفقات بعد الإضافة {open_after:.2f}$ تتجاوز الحد.", {"risk_amount":risk_amount,"position_size":position_size,"rr_tp1":rr1,"rr_tp10":rr10}
+    daily_after=daily_risk_exposure()+risk_amount
+    max_daily=ACCOUNT_BALANCE*DAILY_RISK_LIMIT_PCT/100.0
+    if DAILY_RISK_LIMIT_PCT>0 and daily_after>max_daily+1e-9:
+        return False, f"التعرض اليومي بعد الإضافة {daily_after:.2f}$ يتجاوز الحد.", {"risk_amount":risk_amount,"position_size":position_size,"rr_tp1":rr1,"rr_tp10":rr10}
+    return True,"OK",{"risk_amount":risk_amount,"position_size":position_size,"rr_tp1":rr1,"rr_tp10":rr10}
 
 def risk_gate(analysis: Analysis) -> Tuple[bool, str, dict]:
     risk_amount, position_size, rr_tp1, rr_tp10 = calculate_trade_risk(analysis)
@@ -1083,25 +1197,60 @@ def mark_trade_closed(trade: Trade, price: float, action: str, status: str = "CL
     trade.realized_r = trade.realized_pnl / initial_risk
 
 
-def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None) -> Trade:
+def build_order_levels(analysis: Analysis, side: str, order_type: str = "MARKET") -> Tuple[float, float, List[float]]:
+    """Build a deterministic paper-trade order plan. LIMIT entries are offset from
+    live price by 0.50 ATR and all SL/TP levels are derived from that entry."""
+    atr_v = max(float(analysis.atr_value), 1e-12)
+    live = float(analysis.price)
+    side = side.upper()
+    order_type = order_type.upper()
+    if order_type == "BUY_LIMIT":
+        entry = live - 0.50 * atr_v
+    elif order_type == "SELL_LIMIT":
+        entry = live + 0.50 * atr_v
+    else:
+        entry = live
+    sl = entry - 1.20 * atr_v if side == "BUY" else entry + 1.20 * atr_v
+    multipliers = (0.8, 1.2, 1.6, 2.0, 2.4, 2.8, 3.2, 3.6, 4.0, 4.5)
+    tps = [entry + atr_v*m for m in multipliers] if side == "BUY" else [entry - atr_v*m for m in multipliers]
+    return entry, sl, tps
+
+def apply_trade_mode(analysis: Analysis, mode: str) -> Analysis:
+    """Apply the user's horizon preference without replacing the dynamic engine."""
+    mode = (mode or "dynamic").lower()
+    if analysis.signal not in ("BUY", "SELL"):
+        return analysis
+    if mode == "quick":
+        analysis.duration_minutes = max(1, min(60, analysis.duration_minutes or 15))
+    elif mode == "long":
+        analysis.duration_minutes = max(240, min(MAX_TRADE_DURATION_MINUTES, max(analysis.duration_minutes, 240)))
+    else:
+        analysis.duration_minutes = max(MIN_TRADE_DURATION_MINUTES, min(MAX_TRADE_DURATION_MINUTES, analysis.duration_minutes))
+    return analysis
+
+def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None, order_type: str = "MARKET", side_override: Optional[str] = None) -> Trade:
     now = now_local()
+    side = (side_override or analysis.signal).upper()
+    order_type = order_type.upper()
+    entry, sl, tps = build_order_levels(analysis, side, order_type)
     mins = max(1, round(analysis.duration_minutes * REANALYSIS_PERCENT))
+    pending = order_type in ("BUY_LIMIT", "SELL_LIMIT")
     expiry, expiry_reason = calculate_trade_expiry(now, analysis.duration_minutes, analysis.asset_key)
     market_close = next_market_close(analysis.asset_key, now)
     size = float((risk or {}).get("position_size", 0.0))
     return Trade(
         id=uuid.uuid4().hex[:8].upper(), chat_id=chat_id,
         asset_key=analysis.asset_key, asset_name=analysis.asset_name, symbol=analysis.symbol,
-        side=analysis.signal, entry_low=analysis.entry_low, entry_high=analysis.entry_high,
-        entry_price=analysis.price, sl=analysis.sl, tps=list(analysis.tps),
+        side=side, entry_low=entry, entry_high=entry, entry_price=entry, sl=sl, tps=list(tps),
         opened_at=now.isoformat(), estimated_duration_minutes=analysis.duration_minutes,
         next_reanalysis_at=(now + timedelta(minutes=mins)).isoformat(),
         market_close_at=market_close.isoformat() if market_close else "",
-        status="OPEN", last_price=analysis.price, score=analysis.score, confidence=analysis.confidence,
+        order_type=order_type, pending=pending, activated_at="",
+        status="PENDING" if pending else "OPEN", last_price=analysis.price, score=analysis.score, confidence=analysis.confidence,
         risk_percent=RISK_PER_TRADE_PCT, risk_amount=float((risk or {}).get("risk_amount", 0.0)),
         position_size=size, remaining_position_size=size,
-        rr_tp1=float((risk or {}).get("rr_tp1", 0.0)), rr_tp10=float((risk or {}).get("rr_tp10", 0.0)),
-        tp_allocations=list(TP_ALLOCATION), break_even_price=analysis.price, peak_price=analysis.price,
+        rr_tp1=abs(tps[0]-entry)/max(abs(entry-sl),1e-12), rr_tp10=abs(tps[-1]-entry)/max(abs(entry-sl),1e-12),
+        tp_allocations=list(TP_ALLOCATION), break_even_price=entry, peak_price=entry,
         expiry_at=expiry.isoformat(), expiry_reason=expiry_reason,
     )
 
@@ -1109,7 +1258,7 @@ def create_trade(chat_id: int, analysis: Analysis, risk: Optional[dict] = None) 
 def trade_status_text(trade: Trade) -> str:
     next_time = dt_from_string(trade.next_reanalysis_at).strftime("%Y-%m-%d %H:%M:%S")
     reached = ", ".join(f"TP{x}" for x in trade.hit_tps) if trade.hit_tps else "none"
-    return (f"{trade.asset_name} | {trade.side} | {trade.status}\nID: {trade.id}\n"
+    return (f"{trade.asset_name} | {trade.side} | {trade.status} | {trade.order_type}\nID: {trade.id}\n"
             f"Entry: {format_price(trade.entry_price)}\nSL: {format_price(trade.sl)}\n"
             f"Last price: {format_price(trade.last_price)}\nRisk: {trade.risk_amount:.2f}$ ({trade.risk_percent:.2f}%)\n"
             f"Initial size: {trade.position_size:.6f} | Remaining: {trade.remaining_position_size:.6f}\n"
@@ -1120,7 +1269,7 @@ def trade_status_text(trade: Trade) -> str:
 
 
 def trade_expired(trade: Trade, now: Optional[datetime] = None) -> bool:
-    if trade.status != "OPEN": return False
+    if trade.status not in ("OPEN", "PENDING"): return False
     now = now or now_local()
     opened = dt_from_string(trade.opened_at)
     expiry, reason = calculate_trade_expiry(opened, trade.estimated_duration_minutes, trade.asset_key)
@@ -1133,6 +1282,21 @@ def trade_expired(trade: Trade, now: Optional[datetime] = None) -> bool:
 
 def evaluate_trade_price(trade: Trade, price: float, atr_value: Optional[float] = None) -> List[str]:
     events=[]; trade.last_price=float(price)
+    if trade.status not in ("OPEN", "PENDING"): return events
+    # Pending LIMIT orders become active only after the live price reaches the entry.
+    if trade.pending:
+        touched = (trade.side == "BUY" and price <= trade.entry_price) or (trade.side == "SELL" and price >= trade.entry_price)
+        if not touched:
+            return events
+        trade.pending = False
+        trade.status = "OPEN"
+        trade.activated_at = now_local().isoformat()
+        trade.opened_at = trade.activated_at
+        expiry, reason = calculate_trade_expiry(now_local(), trade.estimated_duration_minutes, trade.asset_key)
+        trade.expiry_at, trade.expiry_reason = expiry.isoformat(), reason
+        trade.next_reanalysis_at = (now_local() + timedelta(minutes=max(1, round(trade.estimated_duration_minutes * REANALYSIS_PERCENT)))).isoformat()
+        trade.last_action = f"{trade.order_type} FILLED"
+        events.append("LIMIT FILLED")
     if trade.status != "OPEN": return events
     if trade.side == "BUY":
         trade.peak_price=max(trade.peak_price, price)
@@ -1258,12 +1422,42 @@ async def perform_asset_analysis(message: types.Message, asset_key: str, create_
 # ============================================================
 # BUTTON-BASED TELEGRAM UI
 # ============================================================
+def trade_priority_key(trade: Trade):
+    now = now_local()
+    try:
+        due = dt_from_string(trade.next_reanalysis_at)
+        overdue = 1 if due <= now else 0
+        minutes_to_review = (due - now).total_seconds() / 60.0
+    except Exception:
+        overdue, minutes_to_review = 0, 999999.0
+    # Highest priority: overdue reviews, then low confidence, then open risk,
+    # then realized R. This is a management priority, not a claim of profit.
+    return (overdue, -minutes_to_review, -float(trade.confidence), float(trade.risk_amount), float(trade.realized_r))
+
+
+async def reanalyze_all_open_trades(reason: str = "manual") -> List[Trade]:
+    async with trade_lock:
+        trades = sorted([t for t in open_trades.values() if t.status == "OPEN"], key=trade_priority_key, reverse=True)
+    results = []
+    for trade in trades:
+        try:
+            updated, _, _ = await reanalyze_trade(trade, reason=reason)
+            results.append(updated)
+        except Exception as exc:
+            trade.last_action = "DATA ERROR - RETRY"
+            logger.exception("Batch reanalysis failed for %s: %s", trade.id, exc)
+    save_state()
+    return sorted(results, key=trade_priority_key, reverse=True)
+
+
 def main_keyboard():
     return types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="🥇 Gold",callback_data="asset:gold"),types.InlineKeyboardButton(text="₿ BTC",callback_data="asset:btc")],
         [types.InlineKeyboardButton(text="💶 EUR/USD",callback_data="asset:eurusd"),types.InlineKeyboardButton(text="🥈 Silver",callback_data="asset:silver")],
         [types.InlineKeyboardButton(text="🛢 Oil",callback_data="asset:oil"),types.InlineKeyboardButton(text="Ξ ETH",callback_data="asset:eth")],
-        [types.InlineKeyboardButton(text="📋 Open Trades",callback_data="trades"),types.InlineKeyboardButton(text="⚙️ Status",callback_data="status")],
+        [types.InlineKeyboardButton(text="📋 Open Trades",callback_data="trades"),types.InlineKeyboardButton(text="🎯 Video Trades",callback_data="video_trades")],
+        [types.InlineKeyboardButton(text="⚡ Quick Trade",callback_data="mode_menu:quick"),types.InlineKeyboardButton(text="🕐 Long Trade",callback_data="mode_menu:long")],
+        [types.InlineKeyboardButton(text="⚙️ Status",callback_data="status")],
         [types.InlineKeyboardButton(text="🛡 Risk",callback_data="risk"),types.InlineKeyboardButton(text="🧠 Strategies",callback_data="strategies")],
         [types.InlineKeyboardButton(text="🧪 Training",callback_data="training"),types.InlineKeyboardButton(text="🏆 Ranking",callback_data="ranking")],
         [types.InlineKeyboardButton(text="📊 Backtest",callback_data="backtest"),types.InlineKeyboardButton(text="📅 Performance",callback_data="performance")],
@@ -1292,37 +1486,74 @@ async def cb_asset(call: types.CallbackQuery):
     try:
         analysis,_=await get_market_snapshot(asset); ai=await improve_analysis_with_ai(analysis)
         text=analysis_message(analysis,ai)
-        buttons=[[types.InlineKeyboardButton(text="🟢 فتح صفقة ورقية",callback_data=f"open:{asset}")]] if analysis.signal in ("BUY","SELL") and analysis.confidence>=MIN_CONFIDENCE_TO_OPEN else []
+        buttons=[]
+        if analysis.signal in ("BUY","SELL") and analysis.confidence>=MIN_CONFIDENCE_TO_OPEN:
+            buttons.append([types.InlineKeyboardButton(text="⚡ صفقة سريعة",callback_data=f"mode:quick:{asset}"), types.InlineKeyboardButton(text="🕐 صفقة طويلة",callback_data=f"mode:long:{asset}")])
+            buttons.append([types.InlineKeyboardButton(text="🟢 Market",callback_data=f"open:market:{asset}:dynamic"), types.InlineKeyboardButton(text="🟡 BUY LIMIT",callback_data=f"open:buy_limit:{asset}:dynamic"), types.InlineKeyboardButton(text="🔴 SELL LIMIT",callback_data=f"open:sell_limit:{asset}:dynamic")])
         buttons += [[types.InlineKeyboardButton(text="🔄 إعادة التحليل",callback_data=f"asset:{asset}")],[types.InlineKeyboardButton(text="⬅️ Home",callback_data="menu")]]
         await call.message.edit_text(text,reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons))
     except Exception as exc:
         await call.message.edit_text(f"❌ فشل التحليل: {str(exc)[:700]}",reply_markup=main_keyboard())
 
-@dp.callback_query(F.data.startswith("open:"))
-async def cb_open(call: types.CallbackQuery):
-    await call.answer("فتح الصفقة...")
-    asset=call.data.split(":",1)[1]
+@dp.callback_query(F.data.startswith("mode_menu:"))
+async def cb_mode_menu(call: types.CallbackQuery):
+    await call.answer()
+    mode=call.data.split(":",1)[1]
+    label="⚡ صفقة سريعة" if mode=="quick" else "🕐 صفقة طويلة"
+    rows=[]
+    for key,cfg in ASSETS.items():
+        rows.append(types.InlineKeyboardButton(text=cfg["name"],callback_data=f"mode:{mode}:{key}"))
+    keyboard=[rows[i:i+2] for i in range(0,len(rows),2)]
+    keyboard.append([types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")])
+    await call.message.edit_text(f"{label}\n\nاختر الأصل:",reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+@dp.callback_query(F.data.startswith("mode:"))
+async def cb_trade_mode(call: types.CallbackQuery):
+    await call.answer("اختيار المدة...")
+    _, mode, asset = call.data.split(":", 2)
     if asset not in ASSETS: return
     try:
         analysis,_=await get_market_snapshot(asset)
-        if analysis.signal not in ("BUY","SELL") or analysis.confidence<MIN_CONFIDENCE_TO_OPEN:
+        apply_trade_mode(analysis, mode)
+        ai=await improve_analysis_with_ai(analysis)
+        text=analysis_message(analysis,ai)
+        buttons=[[types.InlineKeyboardButton(text="🟢 Market",callback_data=f"open:market:{asset}:{mode}"), types.InlineKeyboardButton(text="🟡 BUY LIMIT",callback_data=f"open:buy_limit:{asset}:{mode}"), types.InlineKeyboardButton(text="🔴 SELL LIMIT",callback_data=f"open:sell_limit:{asset}:{mode}")], [types.InlineKeyboardButton(text="⚡ Quick",callback_data=f"mode:quick:{asset}"),types.InlineKeyboardButton(text="🕐 Long",callback_data=f"mode:long:{asset}")],[types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]]
+        await call.message.edit_text(text, reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons))
+    except Exception as exc:
+        await call.message.edit_text(f"❌ فشل إعداد نمط الصفقة: {str(exc)[:700]}", reply_markup=main_keyboard())
+
+@dp.callback_query(F.data.startswith("open:"))
+async def cb_open(call: types.CallbackQuery):
+    await call.answer("تجهيز الصفقة...")
+    parts=call.data.split(":")
+    order_type=parts[1].upper() if len(parts)>2 else "MARKET"
+    asset=parts[2] if len(parts)>2 else parts[1]
+    mode=parts[3].lower() if len(parts)>3 else "dynamic"
+    if asset not in ASSETS: return
+    try:
+        analysis,_=await get_market_snapshot(asset)
+        apply_trade_mode(analysis, mode)
+        if order_type == "BUY_LIMIT": side_override="BUY"
+        elif order_type == "SELL_LIMIT": side_override="SELL"
+        else: side_override=None
+        if side_override is None and (analysis.signal not in ("BUY","SELL") or analysis.confidence<MIN_CONFIDENCE_TO_OPEN):
             await call.message.edit_text("⚠️ لم تعد الإشارة مؤهلة لفتح صفقة.",reply_markup=main_keyboard()); return
         async with trade_lock:
-            if any(t.asset_key==asset and t.status=="OPEN" for t in open_trades.values()):
+            if any(t.asset_key==asset and t.status in ("OPEN","PENDING") for t in open_trades.values()):
                 await call.message.edit_text("⚠️ توجد صفقة مفتوحة لهذا الأصل بالفعل.",reply_markup=main_keyboard()); return
-            if sum(t.status=="OPEN" for t in open_trades.values())>=MAX_OPEN_TRADES:
+            if sum(t.status in ("OPEN","PENDING") for t in open_trades.values())>=MAX_OPEN_TRADES:
                 await call.message.edit_text("⚠️ تم الوصول إلى الحد الأقصى للصفقات المفتوحة.",reply_markup=main_keyboard()); return
-            ok,reason,risk=risk_gate(analysis)
+            ok,reason,risk=risk_gate_for_order(analysis, side_override or analysis.signal, order_type)
             if not ok:
                 await call.message.edit_text(f"🛡️ لم تُفتح الصفقة بسبب إدارة المخاطر:\n{reason}",reply_markup=main_keyboard()); return
-            trade=create_trade(call.message.chat.id,analysis,risk); open_trades[trade.id]=trade; save_state()
+            trade=create_trade(call.message.chat.id,analysis,risk,order_type=order_type,side_override=side_override); open_trades[trade.id]=trade; save_state()
         await call.message.edit_text(trade_status_text(trade),reply_markup=trade_keyboard(trade))
     except Exception as exc:
         await call.message.edit_text(f"❌ فشل فتح الصفقة: {str(exc)[:700]}",reply_markup=main_keyboard())
 
 @dp.callback_query(F.data == "status")
 async def cb_status(call: types.CallbackQuery):
-    await call.answer(); open_count=sum(t.status=="OPEN" for t in open_trades.values())
+    await call.answer(); open_count=sum(t.status in ("OPEN","PENDING") for t in open_trades.values())
     text=(f"⚙️ Status\n\nTelegram: ONLINE\nTwelve Data: {'CONFIGURED' if get_twelve_data_api_key() else 'MISSING'}\nGemini keys: {len(GEMINI_KEYS)}\nOpen trades: {open_count}/{MAX_OPEN_TRADES}\nRisk/trade: {RISK_PER_TRADE_PCT:.2f}%\nOpen risk: {current_open_risk():.2f}$\nDaily exposure: {daily_risk_exposure():.2f}$\nMonitor: {MONITOR_SECONDS}s\nDuration: {MIN_TRADE_DURATION_MINUTES}m → {MAX_TRADE_DURATION_MINUTES}m\nTraining minimum: {STRATEGY_MIN_TRADES} actual trades")
     await call.message.edit_text(text,reply_markup=main_keyboard())
 
@@ -1332,11 +1563,38 @@ async def cb_risk(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "trades")
 async def cb_trades(call: types.CallbackQuery):
-    await call.answer(); trades=[t for t in open_trades.values() if t.status=="OPEN"]
+    await call.answer(); trades=[t for t in open_trades.values() if t.status in ("OPEN","PENDING")]
     if not trades: await call.message.edit_text("📋 لا توجد صفقات مفتوحة.",reply_markup=main_keyboard()); return
-    kb=[]
-    for t in trades: kb.append([types.InlineKeyboardButton(text=f"{t.asset_name} {t.side} • {t.id}",callback_data=f"trade:{t.id}")])
-    kb.append([types.InlineKeyboardButton(text="⚠️ Close ALL",callback_data="close_all_confirm")]); kb.append([types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]); await call.message.edit_text("📋 الصفقات المفتوحة",reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb))
+    trades.sort(key=trade_priority_key, reverse=True)
+    kb=[[types.InlineKeyboardButton(text="🔄 Reanalyze ALL",callback_data="reanalyze_all")]]
+    for t in trades: kb.append([types.InlineKeyboardButton(text=f"{t.asset_name} {t.side} • {t.id} • {t.confidence:.0f}%",callback_data=f"trade:{t.id}")])
+    kb.append([types.InlineKeyboardButton(text="⚠️ Close ALL",callback_data="close_all_confirm")]); kb.append([types.InlineKeyboardButton(text="🏠 Home",callback_data="menu")]); await call.message.edit_text("📋 الصفقات المفتوحة — مرتبة حسب أولوية المتابعة",reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "reanalyze_all")
+async def cb_reanalyze_all(call: types.CallbackQuery):
+    await call.answer("إعادة تحليل كل الصفقات...")
+    try:
+        results = await reanalyze_all_open_trades("batch-button")
+        if not results:
+            await call.message.edit_text("📋 لا توجد صفقات مفتوحة لإعادة تحليلها.", reply_markup=main_keyboard())
+            return
+        lines = ["🔄 تمت إعادة تحليل كل الصفقات المفتوحة", ""]
+        for i, t in enumerate(results, 1):
+            lines.append(f"{i}. {t.asset_name} {t.side} | {t.id} | {t.management} | {t.confidence:.0f}% | R {t.realized_r:.2f}")
+        await call.message.edit_text("\n".join(lines), reply_markup=main_keyboard())
+    except Exception as exc:
+        await call.message.edit_text(f"❌ فشل إعادة التحليل الجماعي: {str(exc)[:700]}", reply_markup=main_keyboard())
+
+
+@dp.callback_query(F.data == "video_trades")
+async def cb_video_trades(call: types.CallbackQuery):
+    await call.answer()
+    rows = sorted(video_trade_setups.values(), key=lambda x: (x.rank_score, x.confidence), reverse=True)[:VIDEO_TRADE_MAX]
+    if not rows:
+        await call.message.edit_text("🎯 لا توجد صفقات مستخرجة من الفيديوهات بعد.", reply_markup=main_keyboard())
+        return
+    await call.message.edit_text(video_trade_summary(rows, VIDEO_TRADE_MAX), reply_markup=main_keyboard())
+
 
 @dp.callback_query(F.data.startswith("trade:"))
 async def cb_trade(call: types.CallbackQuery):
@@ -1429,7 +1687,7 @@ async def cb_news(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "video_help")
 async def cb_video(call: types.CallbackQuery):
-    await call.answer(); await call.message.edit_text("🎥 تحليل الاستراتيجيات من الفيديو\n\nأرسل رابط YouTube/Vimeo/Dailymotion/TikTok/Instagram/Facebook. إذا لم توجد ترجمة، سيُنزل البوت الفيديو ويحلله بصريًا وصوتيًا عبر Gemini لاستخراج الشموع والمؤشرات وقواعد الدخول/الخروج، ثم يحولها إلى استراتيجية قابلة للاختبار والتدريب ≥70 صفقة فعلية + OOS + ترتيب.",reply_markup=main_keyboard())
+    await call.answer(); await call.message.edit_text("🎥 تحليل الاستراتيجيات من الفيديو\n\nأرسل رابط YouTube/Vimeo/Dailymotion/TikTok/Instagram/Facebook. سيدرس البوت الفيديو نفسه بصريًا وصوتيًا لفهم الاستراتيجية، مع استخدام الترجمة كدليل مساعد عند توفرها، ثم يحفظ القواعد الوصفية والقابلة للاختبار ويختبر الجزء القابل للقياس فقط.",reply_markup=main_keyboard())
 
 # ============================================================
 # COMMANDS
@@ -1499,9 +1757,16 @@ async def cmd_trades(message: types.Message):
 async def cmd_reanalyze(message: types.Message):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await safe_send(message, "الاستخدام: /reanalyze TRADE_ID")
+        await safe_send(message, "الاستخدام: /reanalyze TRADE_ID أو /reanalyze ALL")
         return
     tid = parts[1].strip().upper()
+    if tid == "ALL":
+        results = await reanalyze_all_open_trades("manual-all")
+        if not results:
+            await safe_send(message, "📋 لا توجد صفقات مفتوحة لإعادة تحليلها.")
+            return
+        await safe_send(message, "🔄 إعادة تحليل كل الصفقات\n\n" + "\n".join(f"{i}. {t.asset_name} {t.side} | {t.id} | {t.management} | {t.confidence:.0f}%" for i,t in enumerate(results,1)))
+        return
     trade = open_trades.get(tid)
     if not trade or trade.status != "OPEN":
         await safe_send(message, "❌ الصفقة غير موجودة أو ليست مفتوحة.")
@@ -1721,13 +1986,20 @@ class StrategyDefinition:
     max_hold_bars: int
     created_at: str
     updated_at: str
-    unsupported_rules: List[str] = field(default_factory=list)
-    evidence_timestamps: List[str] = field(default_factory=list)
-    methodology: List[str] = field(default_factory=list)
+    strategy_type: str = ""
+    entry_filters: List[str] = field(default_factory=list)
+    no_trade_rules: List[str] = field(default_factory=list)
     risk_rules: List[str] = field(default_factory=list)
     exit_rules: List[str] = field(default_factory=list)
+    methodology: str = ""
     market_conditions: List[str] = field(default_factory=list)
-    source_kind: str = "video"
+    timeframes: List[str] = field(default_factory=list)
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    examples: List[dict] = field(default_factory=list)
+    evidence_timestamps: List[str] = field(default_factory=list)
+    unsupported_rules: List[str] = field(default_factory=list)
+    confidence: float = 0.0
+    source_kind: str = "video_strategy_study"
 
 
 @dataclass
@@ -1945,8 +2217,8 @@ def _gemini_video_url_analyze_sync(url: str, prompt: str, key: str, models: List
             interaction = client.interactions.create(
                 model=model,
                 input=[
+                    {"type": "video", "uri": url, **({"processing": "agentic"} if VIDEO_AGENTIC else {})},
                     {"type": "text", "text": prompt},
-                    {"type": "video", "uri": url},
                 ],
             )
             text = getattr(interaction, "output_text", None)
@@ -2013,8 +2285,7 @@ def _gemini_video_analyze_sync(video_path: str, prompt: str, key: str, models: L
                         "type": "video",
                         "uri": uploaded.uri,
                         "mime_type": getattr(uploaded, "mime_type", "video/mp4"),
-                        # Omit processing metadata for maximum SDK compatibility;
-                        # Gemini's default video processing is static and timestamped.
+                        **({"processing": "agentic"} if VIDEO_AGENTIC else {}),
                     },
                     {"type": "text", "text": prompt},
                 ],
@@ -2033,64 +2304,33 @@ def _gemini_video_analyze_sync(video_path: str, prompt: str, key: str, models: L
     return ""
 
 
-def _video_analysis_prompt() -> str:
-    return r"""
-أنت الآن محلل وباحث استراتيجيات تداول، ولست محلل صفقات.
-المهمة الأساسية هي دراسة الفيديو كاملاً وفهم الاستراتيجية التي يشرحها صاحب الفيديو،
-ثم تحويلها إلى وثيقة استراتيجية دقيقة وقابلة للتعلم والاختبار لاحقاً.
+def _video_analysis_prompt(transcript: str = "") -> str:
+    auxiliary = f"\n\nAUXILIARY TRANSCRIPT — supporting evidence only; verify it against the actual video:\n{transcript[:24000]}" if transcript else ""
+    return f"""
+أنت الآن باحث ومحلل استراتيجيات تداول، ولست محلل صفقات. ادرس الفيديو نفسه دراسة تعليمية عميقة.
+حلّل الكلام المسموع + الصوت المفيد + الشارت + الشموع + المؤشرات + الرسومات + النص الظاهر على الشاشة + ترتيب الأحداث زمنيًا.
+لا تجعل Entry/SL/TP أو أمثلة BUY/SELL هي الهدف الرئيسي، ولا تحول أمثلة الفيديو إلى صفقات تلقائية.
+لا تخترع أرقامًا أو قواعد؛ إذا كانت نقطة غير واضحة صرّح بأنها غير واضحة.
 
-مهم جداً:
-- لا تبحث عن Entry/SL/TP كهدف رئيسي. الأرقام الموجودة في أمثلة الصفقات ليست الهدف.
-- لا تنشئ صفقة من الفيديو لمجرد وجود BUY أو SELL.
-- افهم لماذا ومتى يدخل المتداول، وما التأكيدات المطلوبة، ومتى لا يدخل.
-- افحص الكلام المسموع + النصوص على الشاشة + الشارت + المؤشرات + الرسومات + ترتيب الأحداث الزمنية.
-- إذا تكرر الشرح أو المثال، ادمجه ولا تعتبر التكرار استراتيجية جديدة.
-- ميّز بين القاعدة التي يشرحها صاحب الفيديو وبين مثال تطبيقي عابر.
-- لا تخترع قاعدة أو قيمة أو مؤشر غير ظاهر/مسموع بوضوح.
+استخرج: اسم وفكرة الاستراتيجية ونوعها؛ المؤشرات والقيم؛ قواعد BUY وSELL بالتسلسل والتأكيدات؛
+entry filters؛ no-trade rules والاستثناءات؛ السوق والفريم والجلسة؛ إدارة الصفقة والمخاطر والخروج؛
+شروط النجاح/الفشل والأخطاء؛ الأمثلة التعليمية مع timestamps؛ وما هو قابل للقياس وما هو وصفي/غير قابل للاختبار.
 
-ادرس الفيديو على هذه المحاور:
-1. اسم الاستراتيجية وفكرتها الأساسية.
-2. فلسفة الاستراتيجية: trend-following / reversal / breakout / pullback / range / scalping / غير ذلك.
-3. المؤشرات والأدوات وقيمها كما ظهرت فعلاً.
-4. شروط BUY بالتسلسل، مع شروط التأكيد.
-5. شروط SELL بالتسلسل، مع شروط التأكيد.
-6. شروط عدم الدخول والـ filters والاستثناءات.
-7. كيفية اختيار السوق والفريم والوقت، إذا ذكرها صاحب الفيديو.
-8. إدارة الصفقة: متى يدخل، متى يخرج، تحريك SL، جني الأرباح، BE، trailing، والمدة إن ذُكرت.
-9. إدارة المخاطر وحجم المركز إذا شرحت في الفيديو.
-10. الحالات التي تنجح فيها الاستراتيجية والحالات التي تفشل فيها، كما يدعمها الفيديو.
-11. الأخطاء الشائعة والتحذيرات التي ذكرها صاحب الفيديو.
-12. أمثلة تطبيقية في الفيديو: سجّلها كـ examples/evidence فقط، ولا تحولها تلقائياً إلى صفقات.
-13. timestamps تقريبية لكل قاعدة مهمة أو مثال مهم.
-14. مستوى الثقة لكل جزء، وما الذي لم يكن واضحاً.
+أعد JSON صالحًا فقط بالمفاتيح:
+strategy_name, description, strategy_type, indicators, buy_rules, sell_rules, entry_filters, no_trade_rules,
+risk_rules, exit_rules, methodology, market_conditions, timeframes, parameters, examples, evidence_timestamps,
+unsupported_or_unclear, confidence
 
-أعد JSON صالحاً فقط، بدون Markdown، بهذا الهيكل:
-{
-  "strategy_name": "",
-  "description": "",
-  "strategy_type": "",
-  "indicators": [],
-  "buy_rules": [],
-  "sell_rules": [],
-  "entry_filters": [],
-  "no_trade_rules": [],
-  "risk_rules": [],
-  "exit_rules": [],
-  "methodology": [],
-  "market_conditions": [],
-  "timeframes": [],
-  "parameters": {},
-  "examples": [],
-  "evidence_timestamps": [],
-  "unsupported_or_unclear": [],
-  "confidence": 0
-}
-
-إذا لم تكن هناك استراتيجية واضحة، أعد ما أمكن من الدراسة مع confidence منخفض، ولا تخترع استراتيجية.
+مهم:
+- Entry/SL/TP داخل examples فقط إذا ظهرت بوضوح، ولا تنشئ trade_setups.
+- لا تحوّل BUY/SELL في الأمثلة إلى صفقة.
+- لا تحوّل قاعدة وصفية مثل "كسر هيكل آسيا" إلى شرط رقمي من عندك. احتفظ بها كما هي.
+- confidence = ثقة فهم الاستراتيجية، وليس احتمال ربح صفقة.
+{auxiliary}
 """
 
 
-async def analyze_video_visually(url: str) -> str:
+async def analyze_video_visually(url: str, transcript: str = "") -> str:
     """
     Full multimodal fallback for videos without subtitles.
 
@@ -2101,7 +2341,7 @@ async def analyze_video_visually(url: str) -> str:
     if genai is None or not GEMINI_KEYS:
         return ""
 
-    prompt = _video_analysis_prompt()
+    prompt = _video_analysis_prompt(transcript)
     youtube = any(host in url.lower() for host in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
 
     async def try_keyed_call(callable_fn):
@@ -2225,73 +2465,42 @@ def evaluate_rule(rule: str, price: float, ema20_v: float, ema50_v: float,
 
 async def convert_content_to_strategy(source_url: str, source_text: str) -> Optional[StrategyDefinition]:
     prompt = f"""
-أنت مهندس استراتيجيات. حوّل تقرير دراسة الفيديو التالي إلى StrategyDefinition.
-لا تختصر الاستراتيجية إلى صفقة، ولا تبحث عن Entry/SL/TP من الأمثلة. احتفظ بمنطق الاستراتيجية
-وشروطها، وسجّل القواعد التي لا يمكن تحويلها إلى محرك الاختبار في unsupported_rules بدلاً من حذفها.
-
-القواعد القابلة للاختبار حالياً فقط:
-- price>EMA20 / price<EMA20 / price>=EMA20 / price<=EMA20
-- price>EMA50 / price<EMA50 / price>=EMA50 / price<=EMA50
-- EMA20>EMA50 / EMA20<EMA50 / EMA20>=EMA50 / EMA20<=EMA50
-- RSI>NUMBER / RSI<NUMBER / RSI>=NUMBER / RSI<=NUMBER
-- MACDhist>NUMBER / MACDhist<NUMBER / MACDhist>=NUMBER / MACDhist<=NUMBER
-- momentum6>NUMBER / momentum6<NUMBER / momentum6>=NUMBER / momentum6<=NUMBER
-
-أخرج JSON فقط:
-{{
-  "name":"", "description":"", "indicators":[],
-  "buy_rules":[], "sell_rules":[], "unsupported_rules":[],
-  "evidence_timestamps":[], "methodology":[], "risk_rules":[],
-  "exit_rules":[], "market_conditions":[],
-  "sl_atr":1.2, "tp_atr":1.6, "max_hold_bars":12, "source_kind":"video"
-}}
-
-إذا لم يذكر المصدر SL/TP أو مدة، استخدم 1.2/1.6/12 كإعداد اختبار افتراضي فقط،
-ولا تقدّمها على أنها من الفيديو. ضع ملاحظة واضحة في description.
-لا تحذف القواعد غير المدعومة: انقلها إلى unsupported_rules.
-المصدر التالي هو تقرير/محتوى الفيديو نفسه، وليس مجرد تخمين:
-
+حوّل دراسة الاستراتيجية التالية إلى تعريف منظم دون حذف القواعد غير القابلة للاختبار.
+القواعد الرقمية المدعومة للاختبار فقط: price/EMA20/EMA50 comparisons، RSI comparisons، MACDhist comparisons، momentum6 comparisons.
+إذا كانت قاعدة واضحة لكنها لا تطابق هذه الصيغ، ضعها في unsupported_rules ولا تخترع تحويلًا.
+أخرج JSON فقط بالمفاتيح: name, description, strategy_type, indicators, buy_rules, sell_rules, entry_filters, no_trade_rules,
+risk_rules, exit_rules, methodology, market_conditions, timeframes, parameters, examples, evidence_timestamps, unsupported_rules, confidence, sl_atr, tp_atr, max_hold_bars.
+إذا لم يذكر المصدر SL/TP/مدة، استخدم 1.2/1.6/12 فقط كإعداد Backtest قياسي واذكر أنه افتراضي.
 SOURCE URL: {source_url}
-SOURCE CONTENT:
-{source_text[:50000]}
+SOURCE STUDY:
+{source_text[:30000]}
 """
     ai = await safe_ai_generate(prompt)
     data = extract_json_from_ai(ai)
-    if not data:
-        return None
-
-    buy_rules = [normalize_rule(x) for x in data.get("buy_rules", []) if str(x).strip()]
-    sell_rules = [normalize_rule(x) for x in data.get("sell_rules", []) if str(x).strip()]
-    unsupported = [str(x).strip() for x in data.get("unsupported_rules", []) if str(x).strip()]
-    for rule in buy_rules + sell_rules:
-        if not rule_supported(rule):
-            unsupported.append(rule)
-    # Keep the unsupported rule in the research record, but never backtest it as if supported.
-    buy_rules = [r for r in buy_rules if rule_supported(r)]
-    sell_rules = [r for r in sell_rules if rule_supported(r)]
-
-    if not buy_rules and not sell_rules and not unsupported:
-        return None
+    if not data: return None
+    buy_rules=[normalize_rule(x) for x in data.get("buy_rules",[]) if str(x).strip()]
+    sell_rules=[normalize_rule(x) for x in data.get("sell_rules",[]) if str(x).strip()]
+    unsupported=[str(x).strip() for x in data.get("unsupported_rules",[]) if str(x).strip()]
+    for r in buy_rules+sell_rules:
+        if not rule_supported(r): unsupported.append(r)
+    unsupported=list(dict.fromkeys(unsupported))
+    if not buy_rules and not sell_rules and not unsupported: return None
     try:
-        sl_atr = float(data.get("sl_atr", 1.2)); tp_atr = float(data.get("tp_atr", 1.6)); max_hold = int(data.get("max_hold_bars", 12))
-    except (TypeError, ValueError):
-        sl_atr, tp_atr, max_hold = 1.2, 1.6, 12
-    if sl_atr <= 0 or tp_atr <= 0 or max_hold < 1:
-        sl_atr, tp_atr, max_hold = 1.2, 1.6, 12
-    now = now_local().isoformat(); sid = "STR-" + uuid.uuid4().hex[:8].upper()
-    return StrategyDefinition(
-        id=sid, name=str(data.get("name") or "Video Strategy Study")[:120], source_url=source_url,
-        source_text=source_text[:50000], description=str(data.get("description") or "")[:2500],
-        indicators=[str(x) for x in data.get("indicators", [])][:30], buy_rules=buy_rules, sell_rules=sell_rules,
-        sl_atr=sl_atr, tp_atr=tp_atr, max_hold_bars=max_hold, created_at=now, updated_at=now,
-        unsupported_rules=list(dict.fromkeys(unsupported))[:50],
-        evidence_timestamps=[str(x) for x in data.get("evidence_timestamps", [])][:50],
-        methodology=[str(x) for x in data.get("methodology", [])][:50],
-        risk_rules=[str(x) for x in data.get("risk_rules", [])][:50],
-        exit_rules=[str(x) for x in data.get("exit_rules", [])][:50],
-        market_conditions=[str(x) for x in data.get("market_conditions", [])][:30],
-        source_kind=str(data.get("source_kind") or "video")[:30],
-    )
+        sl_atr=float(data.get("sl_atr",1.2)); tp_atr=float(data.get("tp_atr",1.6)); max_hold=int(data.get("max_hold_bars",12))
+    except (TypeError,ValueError): sl_atr,tp_atr,max_hold=1.2,1.6,12
+    if sl_atr<=0 or tp_atr<=0 or max_hold<1: sl_atr,tp_atr,max_hold=1.2,1.6,12
+    def slist(v,n=50): return [str(x).strip() for x in v if str(x).strip()][:n] if isinstance(v,list) else []
+    try: conf=float(data.get("confidence",0) or 0)
+    except (TypeError,ValueError): conf=0.0
+    now=now_local().isoformat(); sid="STR-"+uuid.uuid4().hex[:8].upper()
+    return StrategyDefinition(id=sid,name=str(data.get("name") or "Learned Strategy")[:120],source_url=source_url,source_text=source_text[:30000],
+        description=str(data.get("description") or "")[:2000],indicators=slist(data.get("indicators"),20),buy_rules=buy_rules,sell_rules=sell_rules,
+        sl_atr=sl_atr,tp_atr=tp_atr,max_hold_bars=max_hold,created_at=now,updated_at=now,strategy_type=str(data.get("strategy_type") or "")[:120],
+        entry_filters=slist(data.get("entry_filters")),no_trade_rules=slist(data.get("no_trade_rules")),risk_rules=slist(data.get("risk_rules")),
+        exit_rules=slist(data.get("exit_rules")),methodology=str(data.get("methodology") or "")[:3000],market_conditions=slist(data.get("market_conditions")),
+        timeframes=slist(data.get("timeframes"),20),parameters=data.get("parameters") if isinstance(data.get("parameters"),dict) else {},
+        examples=data.get("examples") if isinstance(data.get("examples"),list) else [],evidence_timestamps=slist(data.get("evidence_timestamps"),50),
+        unsupported_rules=unsupported,confidence=max(0,min(100,conf)),source_kind="video_strategy_study")
 
 
 def strategy_signal(strategy: StrategyDefinition, candles: List[dict], index: int) -> Optional[str]:
@@ -2393,10 +2602,6 @@ def calculate_strategy_metrics(strategy_id: str, r_values: List[float], tests: i
 
 
 async def train_strategy(strategy: StrategyDefinition) -> StrategyResult:
-    if strategy.unsupported_rules:
-        raise ValueError(
-            "الاستراتيجية تحتوي قواعد غير مدعومة أو غير واضحة؛ تم حفظها للدراسة ولن يتم إجراء Backtest ناقص."
-        )
     async with STRATEGY_TRAINING_LOCK:
         training_status.update({"running":True,"strategy_id":strategy.id,"strategy_name":strategy.name,"tests":0,"trades":0,"message":"loading historical candles"})
         train_values=[]; oos_values=[]; assets_tested=0
@@ -2454,88 +2659,349 @@ def result_from_db(strategy_id: str) -> Optional[StrategyResult]:
 
 
 def strategy_display(strategy: StrategyDefinition, result: Optional[StrategyResult]) -> str:
-    lines = [
-        f"🧠 {strategy.name}",
-        f"ID: {strategy.id}",
-        f"الوصف: {strategy.description or 'غير متوفر'}",
-        f"Indicators: {', '.join(strategy.indicators) if strategy.indicators else '—'}",
-        f"BUY rules: {', '.join(strategy.buy_rules) if strategy.buy_rules else '—'}",
-        f"SELL rules: {', '.join(strategy.sell_rules) if strategy.sell_rules else '—'}",
-        f"SL ATR: {strategy.sl_atr}",
-        f"TP ATR: {strategy.tp_atr}",
-        f"Max hold: {strategy.max_hold_bars} bars",
-        f"Study methodology: {' | '.join(strategy.methodology[:6]) if strategy.methodology else '—'}",
-        f"Risk rules: {' | '.join(strategy.risk_rules[:6]) if strategy.risk_rules else '—'}",
-        f"Exit rules: {' | '.join(strategy.exit_rules[:6]) if strategy.exit_rules else '—'}",
-        f"Market conditions: {' | '.join(strategy.market_conditions[:6]) if strategy.market_conditions else '—'}",
-        f"Unsupported/unclear: {' | '.join(strategy.unsupported_rules[:8]) if strategy.unsupported_rules else 'None'}",
-        f"Evidence: {' | '.join(strategy.evidence_timestamps[:8]) if strategy.evidence_timestamps else '—'}",
-    ]
+    lines=[f"🧠 {strategy.name}",f"ID: {strategy.id}",f"النوع: {strategy.strategy_type or 'غير محدد'}",f"ثقة فهم الفيديو: {strategy.confidence:.0f}%",f"الوصف: {strategy.description or '—'}",
+      f"Indicators: {', '.join(strategy.indicators) if strategy.indicators else '—'}",f"BUY rules (testable): {', '.join(strategy.buy_rules) if strategy.buy_rules else '—'}",
+      f"SELL rules (testable): {', '.join(strategy.sell_rules) if strategy.sell_rules else '—'}",f"Entry filters: {' | '.join(strategy.entry_filters) if strategy.entry_filters else '—'}",
+      f"No-trade: {' | '.join(strategy.no_trade_rules) if strategy.no_trade_rules else '—'}",f"Risk: {' | '.join(strategy.risk_rules) if strategy.risk_rules else '—'}",
+      f"Exit: {' | '.join(strategy.exit_rules) if strategy.exit_rules else '—'}",f"Methodology: {strategy.methodology or '—'}",
+      f"Market conditions: {', '.join(strategy.market_conditions) if strategy.market_conditions else '—'}",f"Timeframes: {', '.join(strategy.timeframes) if strategy.timeframes else '—'}",
+      f"🟡 Unsupported/unclear rules: {len(strategy.unsupported_rules)}"]
+    if strategy.unsupported_rules: lines.append("🟡 " + " | ".join(strategy.unsupported_rules[:9]))
+    if strategy.evidence_timestamps: lines.append("⏱️ Evidence: "+", ".join(strategy.evidence_timestamps[:12]))
+    if strategy.examples: lines.append(f"📚 أمثلة تعليمية: {len(strategy.examples)} — ليست صفقات")
+    lines += [f"SL ATR: {strategy.sl_atr}",f"TP ATR: {strategy.tp_atr}",f"Max hold: {strategy.max_hold_bars} bars"]
     if result:
-        lines += [
-            "",
-            "نتيجة التدريب:",
-            f"Tests: {result.tests}",
-            f"Trades: {result.trades}",
-            f"Wins/Losses: {result.wins}/{result.losses}",
-            f"Win rate: {result.win_rate}%",
-            f"Profit factor: {result.profit_factor}",
-            f"Net R: {result.net_r}",
-            f"Max drawdown R: {result.max_drawdown_r}",
-            f"Expectancy R: {result.expectancy_r}",
-            f"Score: {result.score}/100",
-            f"Robustness: {result.robustness}/100",
-            f"Verdict: {result.verdict}",
-            f"Assets tested: {result.assets_tested}",
-            f"OOS: {result.oos_trades}/{result.oos_tests} trades | WR {result.oos_win_rate}% | Net R {result.oos_net_r} | Score {result.oos_score}",
-            f"Trained: {result.trained_at}",
-        ]
+      lines += ["","🧪 Backtest للجزء القابل للقياس فقط:",f"Tests: {result.tests}",f"Trades: {result.trades}",f"Wins/Losses: {result.wins}/{result.losses}",f"Win rate: {result.win_rate}%",f"Profit factor: {result.profit_factor}",f"Net R: {result.net_r}",f"Expectancy R: {result.expectancy_r}",f"Max DD R: {result.max_drawdown_r}",f"Score: {result.score}/100",f"Robustness: {result.robustness}/100",f"Verdict: {result.verdict}",f"OOS: {result.oos_trades} trades | WR {result.oos_win_rate}% | Net R {result.oos_net_r}"]
     return "\n".join(lines)
 
 
+def _video_asset_key(value: str) -> Optional[str]:
+    text = str(value or "").lower().strip()
+    aliases = {
+        "gold": "gold", "xau": "gold", "xau/usd": "gold", "ذهب": "gold",
+        "btc": "btc", "bitcoin": "btc", "btc/usd": "btc",
+        "eurusd": "eurusd", "eur/usd": "eurusd", "euro": "eurusd",
+        "silver": "silver", "xag": "silver", "xag/usd": "silver",
+        "oil": "oil", "wti": "oil", "crude": "oil",
+        "eth": "eth", "ethereum": "eth", "eth/usd": "eth",
+    }
+    return aliases.get(text)
+
+
+def _safe_float(value, default=0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _rank_video_trade_setup(setup: VideoTradeSetup) -> float:
+    score = 0.0
+    score += min(30.0, max(0.0, setup.confidence) * 0.30)
+    score += min(30.0, max(0.0, setup.completeness) * 0.30)
+    if setup.rr_tp1 > 0:
+        score += min(15.0, setup.rr_tp1 * 6.0)
+    if setup.rr_tp10 > 0:
+        score += min(15.0, setup.rr_tp10 * 3.0)
+    if setup.source_timestamp:
+        score += 5.0
+    if setup.rationale:
+        score += 5.0
+    return round(min(100.0, score), 2)
+
+
+def _candidate_to_setup(raw: dict, source_url: str) -> Optional[VideoTradeSetup]:
+    asset_key=_video_asset_key(raw.get("asset")); side=str(raw.get("side","")).upper().strip()
+    if asset_key not in ASSETS or side not in ("BUY","SELL"): return None
+    entry=_safe_float(raw.get("entry"),0.0); sl=_safe_float(raw.get("sl"),0.0)
+    tps=[_safe_float(raw.get(f"tp{i}"),0.0) for i in range(1,11)]
+    tps=[x for x in tps if x>0]
+    duration=max(0,int(_safe_float(raw.get("duration_minutes"),0)))
+    conf=max(0.0,min(100.0,_safe_float(raw.get("confidence"),0.0)))
+    setup=VideoTradeSetup(id=uuid.uuid4().hex[:10].upper(),source_url=source_url,source_timestamp=str(raw.get("timestamp",raw.get("evidence_timestamp","")) or ""),asset_key=asset_key,asset_name=ASSETS[asset_key]["name"],side=side,entry_price=entry,sl=sl,tps=tps,duration_minutes=duration,confidence=conf,rationale=str(raw.get("rationale","") or "")[:1000],evidence=str(raw.get("evidence",raw.get("entry_hint","")) or "")[:1000],created_at=now_local().isoformat())
+    complete=(entry>0 and sl>0 and bool(tps))
+    setup.completeness=100.0 if complete else 45.0
+    setup.rr_tp1=abs(tps[0]-entry)/max(abs(entry-sl),1e-12) if complete else 0.0
+    setup.rr_tp10=abs(tps[-1]-entry)/max(abs(entry-sl),1e-12) if complete else 0.0
+    setup.rank_score=_rank_video_trade_setup(setup)
+    setup.status="COMPLETE" if complete else "CANDIDATE"
+    return setup
+
+def _rescue_video_trade_candidates(text: str) -> List[dict]:
+    """Deterministic second-pass extraction for common trade lines emitted by
+    multimodal models. It never invents missing values; every numeric value must
+    appear in the source text."""
+    if not text: return []
+    out=[]
+    asset_patterns={
+        "btc":r"(?:bitcoin|btc|xbt|بتكوين|بيتكوين)",
+        "gold":r"(?:gold|xau/?usd|xau|ذهب)",
+        "eurusd":r"(?:eur/?usd|eurusd|euro|اليورو)",
+        "silver":r"(?:silver|xag/?usd|xag|فضة)",
+        "oil":r"(?:oil|wti|crude|نفط)",
+        "eth":r"(?:ethereum|eth|ايثيريوم|إيثيريوم)",
+    }
+    for key,pat in asset_patterns.items():
+        for m in re.finditer(rf"(?is)(?:{pat}).{{0,900}}?(?:\b(BUY|SELL)\b|\b(شراء|بيع)\b).{{0,900}}", text):
+            block=m.group(0); side="BUY" if (m.group(1) or "").upper()=="BUY" or "شراء" in (m.group(2) or "") else "SELL"
+            nums=[float(x.replace(",","")) for x in re.findall(r"(?<![A-Za-z])\d{1,7}(?:,\d{3})*(?:\.\d+)?",block)]
+            if len(nums)<2: continue
+            # Prefer labelled values; fall back only to ordered numbers that are
+            # actually present in the same evidence block.
+            def labelled(names):
+                pat2=r"(?i)(?:"+"|".join(names)+r")\s*[:=@-]?\s*(\d{1,7}(?:,\d{3})*(?:\.\d+)?)"
+                mm=re.search(pat2,block)
+                return float(mm.group(1).replace(",","")) if mm else 0.0
+            entry=labelled(["entry","entry price","الدخول","دخول","limit"])
+            sl=labelled(["sl","stop loss","stop","وقف الخسارة","وقف"])
+            tps=[]
+            for i in range(1,11):
+                v=labelled([f"tp{i}",f"tp {i}",f"target {i}",f"هدف {i}"])
+                if v>0: tps.append(v)
+            if entry<=0 and nums: entry=nums[0]
+            if sl<=0 and len(nums)>1: sl=nums[1]
+            if not tps and len(nums)>2: tps=nums[2:12]
+            out.append({"asset":key,"side":side,"entry":entry or None,"sl":sl or None,**{f"tp{i}":(tps[i-1] if i<=len(tps) else None) for i in range(1,11)},"confidence":80,"rationale":"تم استخراجها من نص/تحليل الفيديو في تمريرة إنقاذ حتمية.","evidence":block[:1000]})
+    # If no explicit numeric setup was recoverable, preserve a directional
+    # candidate so the live engine can create a clearly labelled paper plan.
+    if not out:
+        low=text.lower()
+        for key,pat in asset_patterns.items():
+            if re.search(pat,low):
+                side="BUY" if re.search(r"\bBUY\b|\bشراء\b",text,re.I) else ("SELL" if re.search(r"\bSELL\b|\bبيع\b",text,re.I) else "")
+                if side:
+                    out.append({"asset":key,"side":side,"entry":None,"sl":None,"duration_minutes":None,"confidence":65,"rationale":"اتجاه الصفقة ظهر في محتوى الفيديو لكن أرقام Entry/SL/TP لم تكن قابلة للقراءة؛ سيُنشئ البوت مستويات السوق الحالية ويضع عليها وسمًا واضحًا.","evidence":"اتجاه مستخرج من محتوى الفيديو دون اختلاق أرقام."})
+    return out[:VIDEO_TRADE_MAX]
+
+async def extract_video_trade_setups(source_url: str, source_text: str) -> List[VideoTradeSetup]:
+    # First reuse the structured JSON already returned by the multimodal video
+    # analysis. This avoids a second Gemini call and prevents losing trades when
+    # the abstract strategy parser rejects the video. If no usable JSON exists,
+    # ask Gemini's text model to extract the setups from the visual-analysis text.
+    embedded = extract_json_from_ai(source_text) or {}
+    rows = embedded.get("trade_setups") if isinstance(embedded.get("trade_setups"), list) else embedded.get("trades")
+    if not isinstance(rows, list) and isinstance(embedded.get("video_trade_candidates"), list):
+        rows = embedded.get("video_trade_candidates")
+    if not isinstance(rows, list):
+        rows = None
+
+    prompt = f"""
+استخرج صفقات التداول التي قُدمت فعليًا داخل محتوى الفيديو/التحليل التالي.
+لا تنشئ صفقة جديدة من عندك ولا تحوّل مجرد رأي عام إلى صفقة.
+لكل صفقة أعطِ timestamp إن توفر، الأصل، BUY/SELL، الدخول، SL، TP1..TP10، المدة، الثقة، والسبب.
+الأرقام غير الواضحة يجب أن تكون null. لا تملأ أرقامًا بالتخمين.
+أعد JSON فقط بالشكل:
+{{
+  "trades": [{{
+    "timestamp":"MM:SS", "asset":"gold|btc|eurusd|silver|oil|eth",
+    "side":"BUY|SELL", "entry":null, "sl":null,
+    "tp1":null,"tp2":null,"tp3":null,"tp4":null,"tp5":null,
+    "tp6":null,"tp7":null,"tp8":null,"tp9":null,"tp10":null,
+    "duration_minutes":null,"confidence":0,"rationale":"","evidence":""
+  }}]
+}}
+
+المحتوى:
+{source_text[:50000]}
+"""
+    if rows is None:
+        ai = await safe_ai_generate(prompt)
+        obj = extract_json_from_ai(ai) or {}
+        rows = obj.get("trades") if isinstance(obj.get("trades"), list) else obj.get("trade_setups")
+        if not isinstance(rows, list): rows = obj.get("video_trade_candidates")
+        if not isinstance(rows, list):
+            rows = []
+    result: List[VideoTradeSetup] = []
+    for raw in rows[:VIDEO_TRADE_MAX]:
+        if not isinstance(raw, dict):
+            continue
+        asset_key = _video_asset_key(raw.get("asset"))
+        side = str(raw.get("side", "")).upper().strip()
+        if asset_key not in ASSETS or side not in ("BUY", "SELL"):
+            continue
+        entry = _safe_float(raw.get("entry"), 0.0)
+        sl = _safe_float(raw.get("sl"), 0.0)
+        tps = []
+        for i in range(1, 11):
+            v = raw.get(f"tp{i}")
+            if v is not None and str(v).strip() not in ("", "null", "None"):
+                fv = _safe_float(v, 0.0)
+                if fv > 0:
+                    tps.append(fv)
+        duration = max(0, int(_safe_float(raw.get("duration_minutes"), 0)))
+        confidence = max(0.0, min(100.0, _safe_float(raw.get("confidence"), 0.0)))
+        complete_fields = 2 + min(10, len(tps))
+        possible_fields = 12
+        if entry > 0: complete_fields += 1
+        if sl > 0: complete_fields += 1
+        completeness = min(100.0, complete_fields / possible_fields * 100.0)
+        rr1 = abs(tps[0] - entry) / abs(entry - sl) if entry > 0 and sl > 0 and tps and abs(entry-sl) > 0 else 0.0
+        rr10 = abs(tps[-1] - entry) / abs(entry - sl) if entry > 0 and sl > 0 and tps and abs(entry-sl) > 0 else 0.0
+        setup = VideoTradeSetup(
+            id=uuid.uuid4().hex[:10].upper(),
+            source_url=source_url,
+            source_timestamp=str(raw.get("timestamp", "") or ""),
+            asset_key=asset_key,
+            asset_name=ASSETS[asset_key]["name"],
+            side=side, entry_price=entry, sl=sl, tps=tps,
+            duration_minutes=duration, confidence=confidence,
+            rationale=str(raw.get("rationale", "") or "")[:1000],
+            evidence=str(raw.get("evidence", "") or "")[:1000],
+            completeness=round(completeness, 2), rr_tp1=round(rr1, 3), rr_tp10=round(rr10, 3),
+            created_at=now_local().isoformat(),
+        )
+        setup.rank_score = _rank_video_trade_setup(setup)
+        setup.status = "COMPLETE" if entry > 0 and sl > 0 and tps else "PARTIAL"
+        if setup.duration_minutes > 0:
+            mins = video_trade_reanalysis_minutes(setup)
+            setup.next_reanalysis_at = (now_local() + timedelta(minutes=mins)).isoformat()
+        result.append(setup)
+    result.sort(key=lambda x: (x.rank_score, x.confidence, x.rr_tp10), reverse=True)
+    return result
+
+
+def video_trade_summary(setups: List[VideoTradeSetup], limit: int = 10) -> str:
+    if not setups:
+        return "🎯 لم يتم العثور على صفقة محددة بأرقام يمكن التحقق منها داخل الفيديو."
+    lines = ["🎯 الصفقات المستخرجة من الفيديو — مرتبة من الأقوى إلى الأضعف", ""]
+    for i, s in enumerate(setups[:limit], 1):
+        entry = format_price(s.entry_price) if s.entry_price > 0 else "غير محدد"
+        sl = format_price(s.sl) if s.sl > 0 else "غير محدد"
+        tp1 = format_price(s.tps[0]) if s.tps else "غير محدد"
+        tp10 = format_price(s.tps[-1]) if s.tps else "غير محدد"
+        lines.append(
+            f"{i}. {s.asset_name} | {s.side} | Rank {s.rank_score}/100\n"
+            f"   Entry {entry} | SL {sl} | TP1 {tp1} | Last TP {tp10}\n"
+            f"   Confidence {s.confidence:.0f}% | Completeness {s.completeness:.0f}% | RR1 {s.rr_tp1:.2f} | RR10 {s.rr_tp10:.2f}\n"
+            f"   Timestamp {s.source_timestamp or '—'} | {s.status} | ID {s.id}"
+            + (f"\n   🔄 المراجعة القادمة: {dt_from_string(s.next_reanalysis_at).strftime('%H:%M:%S')}" if s.next_reanalysis_at else "")
+        )
+    return "\n\n".join(lines)
+
+
+
+def video_trade_reanalysis_minutes(setup: VideoTradeSetup, analysis: Optional[Analysis] = None) -> int:
+    """Return the next review interval = 10% of the setup holding time.
+    If the video did not provide a duration, use the live engine's dynamic
+    estimate when available; otherwise use a conservative 60-minute default.
+    """
+    duration = int(setup.duration_minutes or 0)
+    if duration <= 0 and analysis is not None:
+        duration = int(getattr(analysis, "duration_minutes", 0) or 0)
+    if duration <= 0:
+        duration = 60
+    duration = max(MIN_TRADE_DURATION_MINUTES, min(MAX_TRADE_DURATION_MINUTES, duration))
+    return max(1, round(duration * REANALYSIS_PERCENT))
+
+
+def rank_video_trade_with_live(setup: VideoTradeSetup, analysis: Analysis) -> float:
+    """Blend the video evidence with current market confluence without
+    rewriting the original video setup numbers."""
+    score = float(setup.rank_score) * 0.55
+    if analysis.signal == setup.side:
+        score += 25.0
+    elif analysis.signal == "NO TRADE":
+        score += 4.0
+    else:
+        score -= 15.0
+    score += min(10.0, max(0.0, analysis.confidence) * 0.10)
+    if setup.entry_price > 0:
+        distance = abs(analysis.price - setup.entry_price)
+        if setup.sl > 0 and setup.tps:
+            risk = abs(setup.entry_price - setup.sl)
+            if risk > 0 and distance <= risk * 1.5:
+                score += 6.0
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+async def reanalyze_video_trade_setup(setup: VideoTradeSetup, reason: str = "scheduled") -> VideoTradeSetup:
+    """Re-evaluate a concrete trade extracted from a video every 10% of its
+    duration. This is independent of open paper trades, so a video trade is
+    not silently ignored just because the user did not open it as a paper trade.
+    """
+    now = now_local()
+    analysis, _candles = await get_market_snapshot(setup.asset_key)
+    price = float(analysis.price)
+    setup.last_live_price = price
+    setup.last_reanalysis_at = now.isoformat()
+    setup.live_signal = analysis.signal
+    setup.live_confidence = float(analysis.confidence)
+    setup.live_score = int(analysis.score)
+    if setup.duration_minutes <= 0:
+        setup.duration_minutes = max(1, int(analysis.duration_minutes or 60))
+
+    # Determine the current state of the video-provided levels first.
+    if setup.sl > 0 and ((setup.side == "BUY" and price <= setup.sl) or (setup.side == "SELL" and price >= setup.sl)):
+        setup.status = "INVALID - SL LEVEL REACHED"
+        note = "السعر الحالي وصل/تجاوز وقف الخسارة المقدم في الفيديو."
+    elif setup.tps and ((setup.side == "BUY" and price >= setup.tps[-1]) or (setup.side == "SELL" and price <= setup.tps[-1])):
+        setup.status = "TARGET ZONE REACHED"
+        note = "السعر الحالي وصل إلى آخر هدف مقدم في الفيديو."
+    elif analysis.signal == setup.side:
+        setup.status = "VALID - LIVE CONFIRMED"
+        note = "الإشارة الحالية متوافقة مع اتجاه الصفقة المستخرجة من الفيديو."
+    elif analysis.signal == "NO TRADE":
+        setup.status = "WEAK - NO CURRENT SIGNAL"
+        note = "الاتجاه الأصلي محفوظ، لكن المحرك الحالي لا يعطي إشارة جديدة كافية."
+    else:
+        setup.status = "INVALID - DIRECTION CHANGED"
+        note = "المحرك الحالي أعطى اتجاهًا معاكسًا للصفقة المستخرجة."
+    setup.last_reanalysis_note = note
+    setup.rank_score = rank_video_trade_with_live(setup, analysis)
+    mins = video_trade_reanalysis_minutes(setup, analysis)
+    setup.next_reanalysis_at = (now + timedelta(minutes=mins)).isoformat()
+    return setup
+
+
+async def reanalyze_due_video_trades() -> List[VideoTradeSetup]:
+    now = now_local()
+    due = []
+    for setup in list(video_trade_setups.values()):
+        if not setup.next_reanalysis_at or dt_from_string(setup.next_reanalysis_at) <= now:
+            due.append(setup)
+    if not due:
+        return []
+    results = []
+    for setup in sorted(due, key=lambda x: x.rank_score, reverse=True)[:VIDEO_TRADE_MAX]:
+        try:
+            results.append(await reanalyze_video_trade_setup(setup, "scheduled"))
+        except Exception as exc:
+            logger.warning("Video trade scheduled reanalysis failed for %s: %s", setup.id, exc)
+    if results:
+        save_video_trade_setups()
+    return results
+
+
 async def process_strategy_video(message: types.Message, url: str, original_text: str):
-    await safe_send(message, "🎥 تم اكتشاف الفيديو. هذه المرة سأدرسه كـ **استراتيجية تعليمية** وليس كصفقة.\n🧠 سأحلل الكلام + الصوت + الشارت + المؤشرات + القواعد + الأمثلة والتوقيتات.")
-
-    transcript = await extract_video_text(url)
-    source = transcript
-    source_kind = "الترجمة/النص"
-    if not transcript:
-        await safe_send(message, "👁️ لا توجد ترجمة كافية. سأحلل الفيديو نفسه بصريًا وصوتيًا، مع التركيز على فهم الاستراتيجية وليس استخراج Entry/SL/TP.")
-        source = await analyze_video_visually(url)
-        source_kind = "تحليل فيديو بصري/صوتي"
+    await safe_send(message,"🎥 تم اكتشاف الفيديو. هذه المرة سأدرسه كاستراتيجية تعليمية، وليس كصفقة.\n🧠 سأحلل الكلام + الصوت + الشارت + المؤشرات + القواعد + الأمثلة والتوقيتات.")
+    transcript=await extract_video_text(url)
+    if transcript:
+        await safe_send(message,"📝 توجد ترجمة/نص مساعد. سأستخدمه كدليل إضافي، لكن سأحلل الفيديو نفسه بصريًا وصوتيًا أيضًا.")
+    else:
+        await safe_send(message,"👁️ لا توجد ترجمة كافية. سأحلل الفيديو نفسه بصريًا وصوتيًا عبر Gemini.")
+    source=await analyze_video_visually(url,transcript)
+    source_kind="تحليل فيديو بصري/صوتي + نص مساعد"
     if not source:
-        await safe_send(message, "❌ تعذر الوصول إلى محتوى الفيديو أو تحليله. لن أخترع استراتيجية غير موجودة في المصدر.\n" + (f"🔎 آخر خطأ تقني: {VIDEO_LAST_ERROR[:700]}" if VIDEO_LAST_ERROR else "🔎 تحقق من Gemini API وRender Logs."))
+        await safe_send(message,"❌ تعذر الوصول إلى محتوى الفيديو أو تحليله. لن أختلق استراتيجية أو قواعد.")
         return
-
-    strategy = await convert_content_to_strategy(url, source)
+    strategy=await convert_content_to_strategy(url,source)
     if not strategy:
-        await safe_send(message, "⚠️ تم الوصول إلى محتوى الفيديو، لكن لم أستطع تكوين دراسة استراتيجية موثوقة منه. لم يتم اختراع أي قواعد.")
+        await safe_send(message,"❌ تعذر بناء دراسة استراتيجية موثوقة من محتوى الفيديو. لم يتم إنشاء صفقة ولم يتم اختراع قواعد.")
         return
-
-    strategies_db["strategies"][strategy.id] = asdict(strategy)
-    save_strategies()
-
-    supported_count = len(strategy.buy_rules) + len(strategy.sell_rules)
-    text = (
-        f"🧠 **دراسة الاستراتيجية من الفيديو**\n\n"
-        f"الاسم: {strategy.name}\n"
-        f"المصدر: {source_kind}\n"
-        f"ID: {strategy.id}\n\n"
-        f"📌 BUY rules: {len(strategy.buy_rules)}\n"
-        f"📌 SELL rules: {len(strategy.sell_rules)}\n"
-        f"📚 قواعد غير مدعومة/غير واضحة: {len(strategy.unsupported_rules)}\n\n"
-        f"لن أتعامل مع أمثلة BUY/SELL داخل الفيديو كصفقات تلقائيًا. هي أمثلة لفهم الاستراتيجية.\n"
-    )
-    await safe_send(message, text + ("\n🧪 توجد قواعد قابلة للاختبار؛ سأبدأ Backtest + OOS." if supported_count else "\n📖 الدراسة محفوظة للتعلم، لكن لا توجد قواعد كافية مدعومة للاختبار الآلي بعد."))
-
-    if supported_count < 1:
+    strategies_db["strategies"][strategy.id]=asdict(strategy); save_strategies()
+    supported=len(strategy.buy_rules)+len(strategy.sell_rules); unsupported=len(strategy.unsupported_rules)
+    await safe_send(message,f"🧠 **دراسة الاستراتيجية من الفيديو**\n\nالاسم: {strategy.name}\nالمصدر: {source_kind}\nID: {strategy.id}\n\n📌 BUY rules قابلة للاختبار: {len(strategy.buy_rules)}\n📌 SELL rules قابلة للاختبار: {len(strategy.sell_rules)}\n🟡 قواعد وصفية/غير مدعومة: {unsupported}\n\n📚 أمثلة الفيديو أمثلة تعليمية فقط — ليست صفقات.\n🧪 سأختبر فقط الجزء القابل للقياس ({supported} قاعدة) دون اختراع تعريف للقواعد الأخرى.\n⚠️ النتيجة ليست حكمًا نهائيًا على الاستراتيجية كاملة إذا بقيت قواعد غير قابلة للقياس.")
+    if supported==0:
+        await safe_send(message,strategy_display(strategy,None)+"\n\n📚 تم حفظ الدراسة للتعلم، لكن لا توجد قواعد رقمية مدعومة لإجراء Backtest آلي عادل.")
         return
     try:
-        result = await train_strategy(strategy)
-        await safe_send(message, strategy_display(strategy, result) + "\n\n⚠️ الاختبار تاريخي ولا يضمن الأداء المستقبلي. الاستراتيجية لا تدخل التداول الحي تلقائيًا.")
+        result=await train_strategy(strategy)
+        await safe_send(message,strategy_display(strategy,result)+"\n\n⚠️ الاختبار تاريخي للجزء القابل للقياس فقط؛ لا يضمن الأداء المستقبلي ولا يحكم على القواعد الوصفية.")
     except Exception as exc:
         logger.exception("Strategy training failed")
-        await safe_send(message, f"❌ فشل اختبار الاستراتيجية: {str(exc)[:700]}")
+        await safe_send(message,f"❌ فشل Backtest للجزء القابل للقياس: {str(exc)[:700]}")
 
 
 def top_strategies(limit: int = 10):
@@ -2737,6 +3203,25 @@ async def trade_monitor():
     while True:
         try:
             await evaluate_news_learning()
+            try:
+                video_updates = await reanalyze_due_video_trades()
+                for setup in video_updates:
+                    if setup.chat_id:
+                        try:
+                            await safe_reply(setup.chat_id,
+                                f"🔄 إعادة تحليل صفقة الفيديو\n"
+                                f"الأصل: {setup.asset_name} | {setup.side}\n"
+                                f"ID: {setup.id}\n"
+                                f"السعر الحي: {format_price(setup.last_live_price)}\n"
+                                f"الحالة: {setup.status}\n"
+                                f"الإشارة الحالية: {setup.live_signal} | الثقة {setup.live_confidence:.0f}% | Score {setup.live_score}\n"
+                                f"Rank الحالي: {setup.rank_score:.2f}/100\n"
+                                f"{setup.last_reanalysis_note}\n"
+                                f"المراجعة القادمة: {dt_from_string(setup.next_reanalysis_at).strftime('%H:%M:%S')}" )
+                        except Exception:
+                            logger.exception("Could not notify video trade %s", setup.id)
+            except Exception:
+                logger.exception("Video trade monitor error")
             trades=[t for t in list(open_trades.values()) if t.status=="OPEN"]
             # First: lightweight live price monitoring for every open trade.
             await asyncio.gather(*(monitor_one_trade(t) for t in trades), return_exceptions=True)
@@ -2822,6 +3307,7 @@ async def main():
     migrate_legacy_json_to_persistence()
     load_state()
     load_strategies()
+    load_video_trade_setups()
     load_news_learning()
     if not get_twelve_data_api_key(): logger.warning("TWELVE_DATA_API_KEY is missing.")
     if not GEMINI_KEYS: logger.warning("No Gemini API keys configured.")
